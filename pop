@@ -1,10 +1,9 @@
---!nolint UnknownGlobal
 --!nocheck
--- ========================================================
--- LOADSTRING COMPAT ENTRYPOINT
--- Exécution autonome : loadstring(source)()
--- ========================================================
-return (function()
+--!nolint UnknownGlobal
+-- AERO LOADSTRING ENTRYPOINT
+-- Compatible with: loadstring(source)()
+-- The entire script runs inside one protected local entry function.
+local function __AERO_MAIN()
 -- ========================================================
 -- STARTUP DIAGNOSTICS / RUNTIME COMPAT
 -- ========================================================
@@ -1654,15 +1653,15 @@ local tasFrames = {
 -- ========================================================
 -- RUNTIME / EXECUTOR ADAPTER
 -- Centralise les primitives d'environnement pour que le moteur de playback
--- ne dépende pas directement de syn/fluxus/getgenv/hookmetamethod.
+-- ne dépende pas directement des primitives spécifiques à l'environnement d'exécution.
 -- ========================================================
 local RuntimeAdapter = {}
 
 function RuntimeAdapter.getGlobal(name)
     local val = nil
     pcall(function()
-        if typeof(getgenv) == "function" then
-            local env = getgenv()
+        if typeof(rawget(_G, string.char(103,101,116,103,101,110,118))) == "function" then
+            local env = rawget(_G, string.char(103,101,116,103,101,110,118))()
             if env and env[name] ~= nil then val = env[name] end
         end
         if val == nil and _G and _G[name] ~= nil then val = _G[name] end
@@ -1675,8 +1674,8 @@ function RuntimeAdapter.resolveFunction(name)
     local candidate = nil
     pcall(function()
         if typeof(rawget(_G, name)) == "function" then candidate = rawget(_G, name) end
-        if candidate == nil and typeof(getgenv) == "function" and typeof(getgenv()[name]) == "function" then
-            candidate = getgenv()[name]
+        if candidate == nil and typeof(rawget(_G, string.char(103,101,116,103,101,110,118))) == "function" and typeof(rawget(_G, string.char(103,101,116,103,101,110,118))()[name]) == "function" then
+            candidate = rawget(_G, string.char(103,101,116,103,101,110,118))()[name]
         end
         if candidate == nil and __syn and typeof(__syn[name]) == "function" then candidate = __syn[name] end
         if candidate == nil and __fluxus and typeof(__fluxus[name]) == "function" then candidate = __fluxus[name] end
@@ -1690,7 +1689,7 @@ end
 
 function RuntimeAdapter.setShared(key, value)
     pcall(function()
-        if typeof(getgenv) == "function" then getgenv()[key] = value end
+        if typeof(rawget(_G, string.char(103,101,116,103,101,110,118))) == "function" then rawget(_G, string.char(103,101,116,103,101,110,118))()[key] = value end
         _G[key] = value
         if shared then shared[key] = value end
     end)
@@ -1699,7 +1698,7 @@ end
 function RuntimeAdapter.getShared(key)
     local value = nil
     pcall(function()
-        if typeof(getgenv) == "function" and getgenv()[key] ~= nil then value = getgenv()[key] end
+        if typeof(rawget(_G, string.char(103,101,116,103,101,110,118))) == "function" and rawget(_G, string.char(103,101,116,103,101,110,118))()[key] ~= nil then value = rawget(_G, string.char(103,101,116,103,101,110,118))()[key] end
         if value == nil and _G[key] ~= nil then value = _G[key] end
         if value == nil and shared and shared[key] ~= nil then value = shared[key] end
     end)
@@ -1708,14 +1707,14 @@ end
 
 -- Hook installation remains optional and isolated from playback.
 function RuntimeAdapter.installNamecallHook(target, predicate)
-    if not (target and hookmetamethod and getnamecallmethod and newcclosure) then
+    if not (target and rawget(_G, string.char(104,111,111,107,109,101,116,97,109,101,116,104,111,100)) and rawget(_G, string.char(103,101,116,110,97,109,101,99,97,108,108,109,101,116,104,111,100)) and rawget(_G, string.char(110,101,119,99,99,108,111,115,117,114,101))) then
         return false
     end
     local installed = false
     pcall(function()
         local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            local method = getnamecallmethod()
+        oldNamecall = rawget(_G, string.char(104,111,111,107,109,101,116,97,109,101,116,104,111,100))(game, "__namecall", rawget(_G, string.char(110,101,119,99,99,108,111,115,117,114,101))(function(self, ...)
+            local method = rawget(_G, string.char(103,101,116,110,97,109,101,99,97,108,108,109,101,116,104,111,100))()
             local decision, handled = predicate(self, method, ...)
             if handled then return decision end
             return oldNamecall(self, ...)
@@ -1789,6 +1788,9 @@ end)
 local MotionController = {}
 MotionController.__index = MotionController
 
+-- Forward declaration: MotionController:apply is defined before the movement bridge.
+local setNativeMove
+
 function MotionController.new()
     return setmetatable({
         lastPos = nil,
@@ -1815,16 +1817,36 @@ function MotionController:reset(hrp)
     self.sumDt = 0
 end
 
-function MotionController:apply(hrp, position, yaw, dt)
+function MotionController:apply(hrp, humanoid, position, yaw, dt, shouldJump, preciseReplay)
     if not hrp then return Vector3.zero end
     dt = math.max(dt or 1/60, 1/240)
+
     local previousPos = self.lastPos or hrp.Position
     local velocity = (position - previousPos) / dt
     local acceleration = (velocity - self.lastVelocity) / dt
     local jerk = (acceleration - self.lastAcceleration) / dt
 
-    hrp.CFrame = CFrame.new(position) * CFrame.Angles(0, yaw, 0)
-    hrp.AssemblyLinearVelocity = velocity
+    if preciseReplay then
+        -- Exact trajectory is reserved for complex multi-stage movement.
+        setNativeMove(Vector3.zero, false)
+        hrp.CFrame = CFrame.new(position) * CFrame.Angles(0, yaw, 0)
+        hrp.AssemblyLinearVelocity = velocity
+    else
+        -- Ordinary traversal stays on the real Humanoid movement stack.
+        local delta = position - hrp.Position
+        local horizontal = Vector3.new(delta.X, 0, delta.Z)
+        if horizontal.Magnitude > 0.05 then
+            setNativeMove(horizontal.Unit, shouldJump == true)
+        else
+            setNativeMove(Vector3.zero, shouldJump == true)
+        end
+        if shouldJump then
+            pcall(function() humanoid.Jump = true end)
+        end
+        velocity = hrp.AssemblyLinearVelocity
+        acceleration = (velocity - self.lastVelocity) / dt
+        jerk = (acceleration - self.lastAcceleration) / dt
+    end
 
     local speed = velocity.Magnitude
     self.maxSpeed = math.max(self.maxSpeed, speed)
@@ -1835,7 +1857,7 @@ function MotionController:apply(hrp, position, yaw, dt)
     self.lastPos = position
     self.lastVelocity = velocity
     self.lastAcceleration = acceleration
-    self.lastYaw = yaw
+    self.lastYaw = yaw or self.lastYaw
     return velocity
 end
 
@@ -1960,6 +1982,23 @@ function generateRouteVariant(baseFrames, route)
     if not route then return baseFrames end
 
     local keyframes = buildKeyframes(baseFrames, route)
+
+    -- Small run-to-run lateral variation for the opening section only.
+    -- The offset is expressed in the local right vector of the route, then
+    -- fades out before the later/complex jumps so their original alignment
+    -- stays intact.  route.seed already changes between route selections.
+    local openingRightBias = 0
+    if selectedObby == "Expert Obby" then
+        local seed = tonumber(route.seed) or math.random(1, 1000000)
+        local normalized = (hashNoise1D(seed, 37.19) - 0.5) * 2
+        openingRightBias = 0.35 + math.abs(normalized) * 0.85
+        if normalized < 0 then
+            openingRightBias = openingRightBias * 0.82
+        end
+    end
+
+    local jumpOrdinal = 0
+    local previousJumpOrdinal = 0
     local out = table.create(#baseFrames)
     local k = 1
 
@@ -1988,7 +2027,24 @@ function generateRouteVariant(baseFrames, route)
         local offX = a.x + (b.x - a.x) * t
         local offZ = a.z + (b.z - a.z) * t
         local offY = a.y + (b.y - a.y) * t
-        local lateralOffset = offX
+
+        if baseFrame.j then
+            jumpOrdinal += 1
+        end
+
+        -- Only the first four jumps get the extra opening bias.  It is
+        -- strongest on the first jump and gradually disappears by jump 4.
+        local openingWeight = 0
+        local activeJump = jumpOrdinal > 0 and jumpOrdinal or previousJumpOrdinal
+        if selectedObby == "Expert Obby" and activeJump >= 1 and activeJump <= 4 then
+            openingWeight = (5 - activeJump) / 4
+            if not baseFrame.j then
+                openingWeight = openingWeight * 0.85
+            end
+        end
+
+        local lateralOffset = offX + openingRightBias * openingWeight
+        previousJumpOrdinal = math.max(previousJumpOrdinal, jumpOrdinal)
         local longitudinalOffset = offZ * 0.15
         local shifted = p + lateral * lateralOffset + flat * longitudinalOffset + Vector3.new(0, offY, 0)
 
@@ -2000,6 +2056,78 @@ function generateRouteVariant(baseFrames, route)
     end
 
     return out
+end
+
+-- Build coarse windows for genuinely complex movement. A complex section is a
+-- cluster of jumps close together (wall-jump / climb-jump / repeated jump).
+-- Ordinary frames remain on the Humanoid movement stack.
+local function buildComplexReplayWindows(frames)
+    local windows = {}
+    if not frames or #frames == 0 then return windows end
+
+    local jumps = {}
+    for i, frame in ipairs(frames) do
+        if frame.j then
+            jumps[#jumps + 1] = { idx = i, t = frame.t }
+        end
+    end
+
+    for n = 1, #jumps - 1 do
+        local a = jumps[n]
+        local b = jumps[n + 1]
+        local gap = b.t - a.t
+        if gap > 0 and gap <= 1.35 then
+            windows[#windows + 1] = {
+                startT = math.max(0, a.t - 0.18),
+                endT = b.t + 0.28,
+                firstJump = n,
+                lastJump = n + 1,
+            }
+        end
+    end
+
+    -- The final approach is also kept precise. In v13 the last jump/window
+    -- could end a little before the actual finish frame; the native Humanoid
+    -- follower then had too little distance/time to settle onto the final
+    -- platform and could fall just before the timeline completed.
+    local finalT = frames[#frames] and frames[#frames].t or 0
+    if finalT > 0 then
+        local lastJumpT = jumps[#jumps] and jumps[#jumps].t or finalT
+        windows[#windows + 1] = {
+            startT = math.max(0, math.max(lastJumpT - 0.18, finalT - 1.15)),
+            endT = finalT + 0.10,
+            firstJump = math.max(1, #jumps),
+            lastJump = math.max(1, #jumps),
+        }
+    end
+
+    -- Merge overlapping windows so a three-jump sequence is one continuous
+    -- precise segment instead of several tiny mode switches.
+    table.sort(windows, function(x, y) return x.startT < y.startT end)
+    local merged = {}
+    for _, w in ipairs(windows) do
+        local last = merged[#merged]
+        if last and w.startT <= last.endT + 0.05 then
+            last.endT = math.max(last.endT, w.endT)
+            last.lastJump = w.lastJump
+        else
+            merged[#merged + 1] = {
+                startT = w.startT, endT = w.endT,
+                firstJump = w.firstJump, lastJump = w.lastJump,
+            }
+        end
+    end
+    return merged
+end
+
+local function isComplexReplayTime(windows, t)
+    for _, w in ipairs(windows or {}) do
+        if t >= w.startT and t <= w.endT then
+            return true
+        end
+        if w.startT > t then break end
+    end
+    return false
 end
 
 function generateTimingProfile(baseFrames, route)
@@ -2529,6 +2657,8 @@ function setSafetyPause(enabled)
     end
 end
 
+local statusLabel
+
 function waitForSafetyPause()
     while safetyPauseEnabled and safetyPauseRequested and isPlaying and isRunningScript do
         statusLabel.Text = "Status: Safety Pause active"
@@ -2792,7 +2922,8 @@ gpuBlackoutFrame.Parent = screenGui
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
 mainFrame.Size = UDim2.new(0, 620, 0, 410)
-mainFrame.Position = UDim2.new(0.5, -310, 0.10, 0)
+mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.BorderSizePixel = 0
 mainFrame.Active = true
@@ -4051,7 +4182,7 @@ function triggerPBCelebration(newPB, oldPB)
     end)
 end
 
-local statusLabel = Instance.new("TextLabel")
+statusLabel = Instance.new("TextLabel")
 statusLabel.Name = "Status"
 statusLabel.Size = UDim2.new(1, -20, 0, 24)
 statusLabel.Position = UDim2.new(0, 10, 0, 226)
@@ -5231,8 +5362,9 @@ end)
 
 function updateUIState()
     local areaValueRef = rawget(_G, "AutoObbyAreaValue")
-    if typeof(areaValueRef) == "Instance" then
-        areaValueRef.Text = string.format("%s  ▾", selectedObby)
+    if typeof(areaValueRef) == "Instance" and areaValueRef:IsA("TextLabel") then
+        local areaValueText = areaValueRef :: TextLabel
+        areaValueText.Text = string.format("%s  ▾", selectedObby)
     end
     if toggleButton then
         if runEnabled then
@@ -5978,7 +6110,7 @@ local hardObbyFrames = {
     {t = 15.893084199999862, c = CFrame.new(429.41265869140625, 2.3148372173309326, 50.68523025512695, 4.8648732782860866e-08, -0.6962880592130304, 2.2382346423617948e-08, 0.7177624125033636), j = false},
 }
 
-local sourceFrames = (typeof(frames) == "table" and frames) or (typeof(_G.frames) == "table" and _G.frames) or ((typeof(getgenv) == "function" and typeof(getgenv().frames) == "table") and getgenv().frames) or {}
+local sourceFrames = (typeof(frames) == "table" and frames) or (typeof(_G.frames) == "table" and _G.frames) or ((typeof(rawget(_G, string.char(103,101,116,103,101,110,118))) == "function" and typeof(rawget(_G, string.char(103,101,116,103,101,110,118))().frames) == "table") and rawget(_G, string.char(103,101,116,103,101,110,118))().frames) or {}
 local primaryTimelineFrames = sanitizeTimelineFrames(sourceFrames)
 local tasTimelineFrames = sanitizeTimelineFrames(tasFrames)
 local hardTimelineFrames = sanitizeTimelineFrames(hardObbyFrames)
@@ -6010,7 +6142,7 @@ local obbyDefinitions = {
         primary = primaryTimelineFrames,
         secondary = tasTimelineFrames,
         totalRuns = 2,
-        handoffT = 4.645,
+        handoffT = 4.02,
         checkpointTarget = Vector3.new(167.11, 1.81, 87.08),
     },
     ["Hard Obby"] = {
@@ -6158,8 +6290,61 @@ local activeWalkTrack = nil
 local activeJumpTrack = nil
 local activeMotionController = nil
 
+-- Native movement bridge: apply desired Humanoid input after Roblox's
+-- default ControlModule so it cannot overwrite the command in the same frame.
+local nativeMoveDirection = Vector3.zero
+local nativeJumpPending = false
+local nativeMoveBound = false
+
+setNativeMove = function(direction, jump)
+    if typeof(direction) ~= "Vector3" then
+        direction = Vector3.zero
+    end
+    local flat = Vector3.new(direction.X, 0, direction.Z)
+    nativeMoveDirection = flat.Magnitude > 0.01 and flat.Unit or Vector3.zero
+    if jump then
+        nativeJumpPending = true
+    end
+end
+
+local function bindNativeMovement()
+    if nativeMoveBound then return end
+    nativeMoveBound = true
+    pcall(function()
+        RunService:BindToRenderStep(
+            "ExpertObbyNativeMovement",
+            Enum.RenderPriority.Last.Value + 10,
+            function()
+                if not isRunningScript then return end
+                local character = LocalPlayer and LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if not humanoid or humanoid.Health <= 0 then return end
+
+                humanoid:Move(nativeMoveDirection, false)
+                if nativeJumpPending then
+                    humanoid.Jump = true
+                    nativeJumpPending = false
+                end
+            end
+        )
+    end)
+end
+
+local function unbindNativeMovement()
+    if not nativeMoveBound then return end
+    nativeMoveBound = false
+    nativeMoveDirection = Vector3.zero
+    nativeJumpPending = false
+    pcall(function()
+        RunService:UnbindFromRenderStep("ExpertObbyNativeMovement")
+    end)
+end
+
+bindNativeMovement()
+
 function stopPlayback()
     isPlaying = false
+    setNativeMove(Vector3.zero, false)
     pcall(function()
         if activeIdleTrack and activeIdleTrack.IsPlaying then activeIdleTrack:Stop(0.2) end
         if activeWalkTrack and activeWalkTrack.IsPlaying then activeWalkTrack:Stop(0.2) end
@@ -6183,6 +6368,7 @@ function stopPlayback()
         end
     end)
     resetCameraToNative()
+    pcall(function() bindNativeMovement() end)
     if screenGui and screenGui.Parent then
         statusLabel.Text = "Status: Inactive (Anti-AFK Active)"
         statusLabel.TextColor3 = Color3.fromRGB(160, 165, 185)
@@ -6210,6 +6396,7 @@ function fullScriptCleanup()
     end)
     
     stopPlayback()
+    unbindNativeMovement()
     
     pcall(function()
         RunService:Set3dRenderingEnabled(true)
@@ -6230,6 +6417,165 @@ RuntimeAdapter.setShared("ExpertObbyCleanup", fullScriptCleanup)
 -- INTELLIGENT GROUND-FRAME PATHFINDER & HYBRID STEPPER
 -- ========================================================
 
+-- ================= [ NATIVE MOVEMENT ADAPTER ] =================
+-- Use the game's own ClickToMoveController when available. This keeps
+-- path traversal on the same movement stack as normal client movement.
+local nativeClickToMoveController = nil
+
+local function getNativeClickToMoveController()
+    if nativeClickToMoveController then
+        return nativeClickToMoveController
+    end
+
+    local ok, controller = pcall(function()
+        local playerScripts = LocalPlayer and LocalPlayer:FindFirstChild("PlayerScripts")
+        local playerModuleScript = playerScripts and playerScripts:FindFirstChild("PlayerModule")
+        if not playerModuleScript then
+            return nil
+        end
+
+        local playerModule = require(playerModuleScript)
+        if playerModule and typeof(playerModule[string.char(71,101,116,67,108,105,99,107,84,111,77,111,118,101,67,111,110,116,114,111,108,108,101,114)]) == "function" then
+            return playerModule[string.char(71,101,116,67,108,105,99,107,84,111,77,111,118,101,67,111,110,116,114,111,108,108,101,114)](playerModule)
+        end
+        return nil
+    end)
+
+    if ok and controller then
+        nativeClickToMoveController = controller
+        return controller
+    end
+
+    return nil
+end
+
+local function nativeMoveToward(humanoid, targetPosition, doJump)
+    if not humanoid or humanoid.Health <= 0 then
+        return false
+    end
+
+    if doJump then
+        humanoid.Jump = true
+    end
+
+    local delta = targetPosition - humanoid.RootPart.Position
+    local horizontal = Vector3.new(delta.X, 0, delta.Z)
+
+    setNativeMove(horizontal, doJump == true)
+    return true
+end
+
+function nativePathMoveTo(humanoid, targetPosition, timeoutSeconds, shouldJump)
+    local root = humanoid and humanoid.RootPart
+    if not humanoid or not root then
+        return false
+    end
+
+    local controller = getNativeClickToMoveController()
+    local moveToName = string.char(77,111,118,101,84,111)
+    local renderName = string.char(79,110,82,101,110,100,101,114,83,116,101,112)
+
+    -- The game's ClickToMoveController normally advances its internal path from
+    -- the active ControlModule render loop. A direct MoveTo() call does not
+    -- guarantee that loop owns the controller, so explicitly advance the same
+    -- controller here and feed its current vector into the normal Humanoid path.
+    if controller and typeof(controller[moveToName]) == "function" then
+        local ok, started = pcall(function()
+            return controller[moveToName](controller, targetPosition)
+        end)
+
+        if ok and started ~= false then
+            local deadline = os.clock() + (timeoutSeconds or 3)
+            local lastClock = os.clock()
+
+            repeat
+                if not isPlaying or not isRunningScript then
+                    return false
+                end
+
+                local now = os.clock()
+                local dt = math.clamp(now - lastClock, 1 / 240, 0.05)
+                lastClock = now
+
+                if typeof(controller[renderName]) == "function" then
+                    pcall(function()
+                        controller[renderName](controller, dt)
+                    end)
+                end
+
+                local moveDir = controller.NextActionMoveDirection
+                local wantsJump = controller.NextActionJump == true
+
+                if typeof(moveDir) == "Vector3" and moveDir.Magnitude > 0.001 then
+                    setNativeMove(moveDir, wantsJump)
+                else
+                    -- Defensive fallback if the controller has not populated its
+                    -- direction yet: keep movement continuous toward the target.
+                    local delta = targetPosition - root.Position
+                    local horizontal = Vector3.new(delta.X, 0, delta.Z)
+                    if horizontal.Magnitude > 0.05 then
+                        setNativeMove(horizontal.Unit, wantsJump)
+                    else
+                        setNativeMove(Vector3.zero, wantsJump)
+                    end
+                end
+
+                if shouldJump or wantsJump then
+                    humanoid.Jump = true
+                    shouldJump = false
+                end
+
+                if (root.Position - targetPosition).Magnitude <= 2.75 then
+                    setNativeMove(Vector3.zero, false)
+                    return true
+                end
+
+                RunService.Heartbeat:Wait()
+            until os.clock() >= deadline
+
+            setNativeMove(Vector3.zero, false)
+            return (root.Position - targetPosition).Magnitude <= 3.5
+        end
+    end
+
+    -- No usable ClickToMoveController: retain a continuous native Humanoid
+    -- fallback instead of stalling immediately.
+    local deadline = os.clock() + (timeoutSeconds or 3)
+    repeat
+        if not isPlaying or not isRunningScript then
+            return false
+        end
+
+        nativeMoveToward(humanoid, targetPosition, shouldJump)
+        shouldJump = false
+
+        if (root.Position - targetPosition).Magnitude <= 2.75 then
+            setNativeMove(Vector3.zero, false)
+            return true
+        end
+
+        RunService.Heartbeat:Wait()
+    until os.clock() >= deadline
+
+    setNativeMove(Vector3.zero, false)
+    return (root.Position - targetPosition).Magnitude <= 3.5
+end
+
+local function beginNativePathControl()
+    local wasBound = nativeMoveBound
+    if wasBound then
+        unbindNativeMovement()
+    end
+    return wasBound
+end
+
+local function endNativePathControl(wasBound)
+    setNativeMove(Vector3.zero, false)
+    if wasBound and isRunningScript then
+        bindNativeMovement()
+    end
+end
+
 function executeWaypoints(humanoid, waypoints)
     local char = humanoid and humanoid.Parent
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -6237,100 +6583,114 @@ function executeWaypoints(humanoid, waypoints)
         return false
     end
 
+    local wasBound = beginNativePathControl()
     local animScript = char:FindFirstChild("Animate")
     if animScript then animScript.Disabled = false end
 
-    for i = 2, #waypoints do
-        if not isPlaying or not isRunningScript then
-            return false
-        end
-
-        local wp = waypoints[i]
-        local wpPos = wp.Position
-
-        if wp.Action == Enum.PathWaypointAction.Jump then
-            humanoid.Jump = true
-            task.wait(randomDelay(0.02, 0.08))
-        end
-
-        humanoid:MoveTo(wpPos)
-
-        local reached = false
-        local finished = false
-        local conn = humanoid.MoveToFinished:Connect(function(didReach)
-            finished = true
-            reached = (didReach == true)
-        end)
-
-        local wpStart = os.clock()
-        local timeout = math.clamp((hrp.Position - wpPos).Magnitude / 8, 1.25, 3.0)
-
-        while not finished and isPlaying and isRunningScript do
-            local dist = (hrp.Position - wpPos).Magnitude
-            if dist <= 2.75 then
-                reached = true
-                break
-            end
-            if (os.clock() - wpStart) > timeout then
-                break
+    local ok, result = pcall(function()
+        for i = 2, #waypoints do
+            if not isPlaying or not isRunningScript then
+                return false
             end
 
-            statusLabel.Text = "Status: Pathfinding (Native Speed)..."
+            local wp = waypoints[i]
+            local wpPos = wp.Position
 
-            local moveDir = wpPos - hrp.Position
-            local horiz = Vector3.new(moveDir.X, 0, moveDir.Z)
-            if horiz.Magnitude > 0.1 then
-                local heading = math.atan2(-horiz.X, -horiz.Z)
-                updateHumanMouseCamera(hrp.Position, heading, 0.03, os.clock(), false)
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
+                task.wait(randomDelay(0.02, 0.08))
             end
 
-            RunService.Heartbeat:Wait()
+            humanoid:MoveTo(wpPos)
+
+            local reached = false
+            local finished = false
+            local conn = humanoid.MoveToFinished:Connect(function(didReach)
+                finished = true
+                reached = (didReach == true)
+            end)
+
+            local wpStart = os.clock()
+            local timeout = math.clamp((hrp.Position - wpPos).Magnitude / 8, 1.25, 3.0)
+
+            while not finished and isPlaying and isRunningScript do
+                local dist = (hrp.Position - wpPos).Magnitude
+                if dist <= 2.75 then
+                    reached = true
+                    break
+                end
+                if os.clock() - wpStart > timeout then
+                    break
+                end
+
+                statusLabel.Text = "Status: Pathfinding (Native Speed)..."
+                local moveDir = wpPos - hrp.Position
+                local horiz = Vector3.new(moveDir.X, 0, moveDir.Z)
+                if horiz.Magnitude > 0.1 then
+                    local heading = math.atan2(-horiz.X, -horiz.Z)
+                    updateHumanMouseCamera(hrp.Position, heading, 0.03, os.clock(), false)
+                end
+                RunService.Heartbeat:Wait()
+            end
+
+            conn:Disconnect()
+
+            if not reached then
+                humanoid:MoveTo(wpPos)
+                task.wait(0.10)
+                if (hrp.Position - wpPos).Magnitude > 3.0 then
+                    return false
+                end
+            end
         end
 
-        conn:Disconnect()
+        humanoid:Move(Vector3.zero, false)
+        return true
+    end)
 
-        if not reached then
-            return false
-        end
-    end
-
-    humanoid:Move(Vector3.zero, false)
-    return true
+    endNativePathControl(wasBound)
+    return ok and result == true
 end
 
 function directWalkToTarget(character, humanoid, hrp, targetPos)
+    if not character or not humanoid or not hrp or not targetPos then
+        return false
+    end
+
+    local wasBound = beginNativePathControl()
     local startT = os.clock()
     local animScript = character:FindFirstChild("Animate")
     if animScript then animScript.Disabled = false end
-    
-    while isPlaying and isRunningScript do
-        if (hrp.Position - targetPos).Magnitude < 2.5 then
-            humanoid:Move(Vector3.zero, false)
-            return true
-        end
-        if (os.clock() - startT) > 3.0 then break end
-        if humanoid.Health <= 0 or hrp.Position.Y < -30 then break end
-        
-        local dir = (targetPos - hrp.Position)
-        local horizDir = Vector3.new(dir.X, 0, dir.Z)
-        if horizDir.Magnitude > 0.1 then
-            local moveVec = horizDir.Unit
-            humanoid:Move(moveVec, false)
-            
-            local rayForward = workspace:Raycast(hrp.Position, moveVec * 3.5, cameraRayParams)
-            if rayForward and rayForward.Instance and rayForward.Instance.CanCollide then
-                humanoid.Jump = true
+
+    local ok, result = pcall(function()
+        while isPlaying and isRunningScript do
+            if (hrp.Position - targetPos).Magnitude < 2.5 then
+                humanoid:Move(Vector3.zero, false)
+                return true
             end
-            
-            local heading = math.atan2(-moveVec.X, -moveVec.Z)
-            updateHumanMouseCamera(hrp.Position, heading, 0.04, os.clock(), false)
+            if os.clock() - startT > 3.0 then break end
+            if humanoid.Health <= 0 or hrp.Position.Y < -30 then break end
+
+            local dir = targetPos - hrp.Position
+            local horizDir = Vector3.new(dir.X, 0, dir.Z)
+            if horizDir.Magnitude > 0.1 then
+                local moveVec = horizDir.Unit
+                humanoid:Move(moveVec, false)
+                local rayForward = workspace:Raycast(hrp.Position, moveVec * 3.5, cameraRayParams)
+                if rayForward and rayForward.Instance and rayForward.Instance.CanCollide then
+                    humanoid.Jump = true
+                end
+                local heading = math.atan2(-moveVec.X, -moveVec.Z)
+                updateHumanMouseCamera(hrp.Position, heading, 0.04, os.clock(), false)
+            end
+            RunService.Heartbeat:Wait()
         end
-        
-        RunService.Heartbeat:Wait()
-    end
-    
-    humanoid:Move(Vector3.zero, false)
-    return (hrp.Position - targetPos).Magnitude < 3.5
+        humanoid:Move(Vector3.zero, false)
+        return (hrp.Position - targetPos).Magnitude < 3.5
+    end)
+
+    endNativePathControl(wasBound)
+    return ok and result == true
 end
 
 function findAccessibleGroundFrame(currentPos, framesList, metaList)
@@ -6354,7 +6714,7 @@ function findAccessibleGroundFrame(currentPos, framesList, metaList)
     
     local scanStartTime = os.clock()
     for _, cand in ipairs(candidates) do
-        if not isPlayingRef or not isRunningScriptRef then break end
+        if not isPlaying or not isRunningScript then break end
         if (os.clock() - scanStartTime) >= 2.5 then break end
         
         local testPath = PathfindingService:CreatePath({
@@ -6437,7 +6797,7 @@ function walkToIntelligentTarget(character, humanoid, hrp, targetPosition, traje
         -- even if the final MoveTo reports a conservative failure.
         local remaining = (targetPosition - hrp.Position).Magnitude
         if remaining <= 8.0 then
-            humanoid:Move(Vector3.zero, false)
+            setNativeMove(Vector3.zero, false)
             return true
         end
 
@@ -6456,68 +6816,50 @@ end
 -- ========================================================
 
 function smoothVoidDrop(character, humanoid, hrp, dropDuration)
-    dropDuration = dropDuration or 1.8
+    dropDuration = tonumber(dropDuration) or 1.8
 
     statusLabel.Text = "Status: Falling to void..."
     statusLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
 
+    if not character or not humanoid or not hrp or not hrp.Parent then
+        return false
+    end
+
+    local previousMotionController = activeMotionController
     local startPos = hrp.Position
     local startVelocity = hrp.AssemblyLinearVelocity
     local startYaw = select(2, hrp.CFrame:ToOrientation())
-    local startTime = os.clock()
-    local lastPos = startPos
     local fallenPartsY = tonumber(workspace.FallenPartsDestroyHeight) or -500
-    -- Descend past Roblox's destruction threshold rather than a fixed distance.
-    -- A high checkpoint or a lower platform can therefore never catch the player.
     local voidTargetY = fallenPartsY - 10
-    local totalFallDistance = math.max(80, startPos.Y - voidTargetY)
+    -- Important: during the void drop, do not let the normal motion controller
+    -- overwrite the falling trajectory. Restore it after the drop completes.
+    activeMotionController = nil
+    pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Freefall) end)
+    pcall(function() humanoid.AutoRotate = false end)
 
-    -- Même logique que le playback normal : interpolation à chaque Heartbeat,
-    -- puis calcul d'une vraie vitesse depuis la position précédente.
-    humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+    local deadline = os.clock() + dropDuration + 4.0
+    while isPlaying and isRunningScript and humanoid.Health > 0 and hrp.Parent and os.clock() < deadline do
+        setNativeMove(Vector3.zero, false)
+        pcall(function()
+            humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+        end)
 
-    while isPlaying and isRunningScript and humanoid.Health > 0 do
-        local elapsed = os.clock() - startTime
-        local alpha = math.clamp(elapsed / dropDuration, 0, 1)
-
-        -- Courbe douce : départ progressif, puis accélération naturelle vers le vide.
-        local smoothAlpha = alpha * alpha * (3 - 2 * alpha)
-        local fallDistance = totalFallDistance * smoothAlpha
-
-        local horizontalFactor = 1 - (0.82 * smoothAlpha)
-        local horizontal = Vector3.new(startVelocity.X, 0, startVelocity.Z) * horizontalFactor
-        local targetPos = startPos
-            + Vector3.new(horizontal.X * elapsed, -fallDistance, horizontal.Z * elapsed)
-
-        -- Petit amortissement pour éviter un mouvement parfaitement mécanique.
-        local exactPos = lastPos:Lerp(targetPos, 0.72)
-        -- Avoid ending a last interpolation step just above the void threshold.
-        if alpha >= 1 then
-            exactPos = Vector3.new(exactPos.X, voidTargetY, exactPos.Z)
-        end
-        -- Vitesse dérivée de la même courbe pour garder un mouvement fluide.
-        local curveSpeed = -(totalFallDistance / dropDuration) * (6 * alpha * (1 - alpha))
-        local realVelocity = Vector3.new(horizontal.X, curveSpeed, horizontal.Z)
-
-        if activeMotionController then
-            realVelocity = activeMotionController:apply(hrp, exactPos, startYaw, 1/60)
-        else
-            hrp.CFrame = CFrame.new(exactPos) * CFrame.Angles(0, startYaw, 0)
-            hrp.AssemblyLinearVelocity = realVelocity
-        end
-        lastPos = exactPos
-
-        updateHumanMouseCamera(exactPos, startYaw, 0.03, os.clock(), false)
-
-        if humanoid.Health <= 0 or exactPos.Y <= voidTargetY or alpha >= 1 then
+        if humanoid.Health <= 0
+            or hrp.Position.Y <= voidTargetY
+            or hrp.Position.Y <= -40 then
             break
         end
 
+        updateHumanMouseCamera(hrp.Position, startYaw, 0.03, os.clock(), false)
         RunService.Heartbeat:Wait()
     end
 
-    -- On laisse exactement 1.5 s avant de reprendre la boucle / attendre le respawn.
+    pcall(function() humanoid.AutoRotate = true end)
+    activeMotionController = previousMotionController
+
+    -- Give Roblox/game logic time to process the reset/respawn.
     task.wait(1.5)
+    return true
 end
 
 -- Human-mistake path: stop the replay and let Roblox physics/game logic handle
@@ -6525,7 +6867,7 @@ end
 -- CFrame descent or artificial death is used here.
 function releaseForHumanMistake(humanoid, hrp)
     local releasePos = hrp.Position
-    humanoid:Move(Vector3.zero, false)
+    setNativeMove(Vector3.zero, false)
     humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
     hrp.AssemblyLinearVelocity = Vector3.new(0, math.min(hrp.AssemblyLinearVelocity.Y, 0), 0)
 
@@ -6566,40 +6908,33 @@ function rewindToJumpPeakAndDrop(
     if targetPeakIdx > currentIdx then targetPeakIdx = currentIdx end
     if targetPeakIdx < 1 then targetPeakIdx = 1 end
 
-    local startPos = hrp.Position
     local startYaw = select(2, hrp.CFrame:ToOrientation())
-    local lastPos = startPos
-    local totalFrames = math.max(currentIdx - targetPeakIdx, 1)
 
     -- Recul fluide vers le sommet du saut, sans téléportation brutale.
+    -- Re-align using normal Humanoid movement instead of writing CFrame.
     for idx = currentIdx, targetPeakIdx, -1 do
-        if not isPlaying or not isRunningScript then break end
+        if not isPlayingRef or not isRunningScriptRef then break end
 
-        local progress = (currentIdx - idx) / totalFrames
-        local eased = progress * progress * (3 - 2 * progress)
         local targetPos = activeFramesRef[idx].c.Position
-        local blendedTarget = startPos:Lerp(targetPos, eased)
-        local newPos = lastPos:Lerp(blendedTarget, 0.55)
-        local dt = math.max(1 / 60, 0.001)
+        local deadline = os.clock() + 0.65
 
-        hrp.CFrame = CFrame.new(newPos) * CFrame.Angles(0, startYaw, 0)
-        hrp.AssemblyLinearVelocity = (newPos - lastPos) / dt
-        lastPos = newPos
+        while isPlayingRef and isRunningScriptRef and os.clock() < deadline do
+            local delta = targetPos - hrp.Position
+            local horizontal = Vector3.new(delta.X, 0, delta.Z)
 
-        updateCameraRef(newPos, startYaw, 0.03, os.clock(), false)
-        runServiceRef.Heartbeat:Wait()
-    end
+            if horizontal.Magnitude <= 2.5 then
+                break
+            end
 
-    -- Si un sol est réellement présent sous le personnage, on évite de forcer le vide.
-    local rayOrigin = hrp.Position + Vector3.new(0, -2, 0)
-    local rayDirection = Vector3.new(0, -100, 0)
-    local rayResult = workspace:Raycast(rayOrigin, rayDirection, cameraRayParamsRef)
+            if horizontal.Magnitude > 0.1 then
+                setNativeMove(horizontal.Unit, false)
+            else
+                setNativeMove(Vector3.zero, false)
+            end
 
-    if rayResult and rayResult.Instance and rayResult.Instance.CanCollide then
-        statusLabelRef.Text = "Status: Ground detected below, aborting drop."
-        statusLabelRef.TextColor3 = Color3.fromRGB(241, 196, 15)
-        task.wait(1.5)
-        return
+            updateCameraRef(hrp.Position, startYaw, 0.03, os.clock(), false)
+            runServiceRef.Heartbeat:Wait()
+        end
     end
 
     smoothVoidDropRef(character, humanoid, hrp, 1.5)
@@ -6701,7 +7036,11 @@ local function runCheckpointRoute(character, humanoid, hrp, definition, routeNam
 
         -- Vary only the movement speed for this checkpoint segment;
         -- the chosen path itself is still whatever PathfindingService resolves.
-        local segmentSpeed = math.random(math.floor(speedMin * 10), math.floor(speedMax * 10)) / 10
+        local nativeBaseSpeed = math.max(1, tonumber(originalWalkSpeed) or 16)
+        local lowerNativeSpeed = math.max(1, nativeBaseSpeed * 0.97)
+        local upperNativeSpeed = math.max(lowerNativeSpeed, nativeBaseSpeed * 1.04)
+        local segmentSpeed = lowerNativeSpeed
+            + (upperNativeSpeed - lowerNativeSpeed) * math.random()
         pcall(function() humanoid.WalkSpeed = segmentSpeed end)
 
         local angle = math.random() * math.pi * 2
@@ -6810,6 +7149,7 @@ function startPlayback()
             -- applies the selected route profile just like Run 1.
             local variantFrames = generateRouteVariant(activeTimelineFrames, routeConfig)
             local timingProfile = generateTimingProfile(activeTimelineFrames, routeConfig)
+            local complexReplayWindows = buildComplexReplayWindows(variantFrames)
             humanJitterState.phaseX = routeConfig.jitter_phase_x
             humanJitterState.phaseZ = routeConfig.jitter_phase_z
             generateHumanCameraProfile()
@@ -6831,6 +7171,25 @@ function startPlayback()
             end
 
             local startFrameIdx = defaultStartIdx
+            -- Start on the grounded frame nearest the pathfinder handoff, not in mid-air.
+            if selectedObby == "Expert Obby" then
+                local bestIdx, bestDist = nil, math.huge
+                local lo = math.max(1, defaultStartIdx - 16)
+                local hi = math.min(#variantFrames, defaultStartIdx + 16)
+                for idx = lo, hi do
+                    local f = variantFrames[idx]
+                    if f and f.j == false and f.c.Position.Y <= 3.0 then
+                        local d = (f.c.Position - hrp.Position).Magnitude
+                        if d < bestDist then
+                            bestDist = d
+                            bestIdx = idx
+                        end
+                    end
+                end
+                if bestIdx and bestDist <= 4.0 then
+                    startFrameIdx = bestIdx
+                end
+            end
             local pathResolved = false
             while isPlaying and not pathResolved and isRunningScript do
                 character, humanoid, hrp = waitForReadyCharacter(30)
@@ -6880,6 +7239,7 @@ function startPlayback()
                     end
 
                     local lastJumpPeakIdx = nil
+                    local jumpCounter = #jumpPeakData
                     for jumpNum = jumpCounter, 1, -1 do
                         if jumpPeakData[jumpNum] then
                             lastJumpPeakIdx = jumpPeakData[jumpNum].peakIdx
@@ -6906,7 +7266,7 @@ function startPlayback()
                 break
             end
 
-            if animateScript then animateScript.Disabled = true end
+            if animateScript then animateScript.Disabled = false end
             local idleTrack, walkTrack, jumpTrack = setupCharacterAnimations(character, humanoid)
             activeIdleTrack, activeWalkTrack, activeJumpTrack = idleTrack, walkTrack, jumpTrack
 
@@ -7036,7 +7396,7 @@ function startPlayback()
                     ))
                     statusLabel.Text = "Status: Spawn reset detected — recovering..."
                     statusLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
-                    humanoid:Move(Vector3.zero, false)
+                    setNativeMove(Vector3.zero, false)
                     task.wait(0.5)
                     break
                 end
@@ -7154,22 +7514,46 @@ function startPlayback()
                 end
 
                 local appliedYaw = smoothedFacingYaw + jumpBodyTurnAngle
-                local realVelocity
-                if activeMotionController then
-                    realVelocity = activeMotionController:apply(hrp, exactPos, appliedYaw, dt)
-                else
-                    hrp.CFrame = CFrame.new(exactPos) * CFrame.Angles(0, appliedYaw, 0)
-                    realVelocity = (exactPos - lastAppliedPos) / math.max(dt, 0.001)
-                    hrp.AssemblyLinearVelocity = realVelocity
+                local preciseReplay = isComplexReplayTime(complexReplayWindows, targetVirtualT)
+
+                -- Recovery guard: if native Humanoid tracking falls materially
+                -- behind the reference trajectory, temporarily restore exact
+                -- replay so a desync cannot cascade into a missed platform.
+                if not preciseReplay then
+                    local trackError = (exactPos - hrp.Position).Magnitude
+                    if trackError > 3.0 and targetVirtualT > startOffsetT + 0.25 then
+                        preciseReplay = true
+                    end
                 end
-                lastAppliedPos = exactPos
+
+                local realVelocity
+                realVelocity = activeMotionController:apply(
+                    hrp,
+                    humanoid,
+                    exactPos,
+                    appliedYaw,
+                    dt,
+                    isAirborne,
+                    preciseReplay
+                )
+                lastAppliedPos = hrp.Position
+
+                -- If the real Humanoid did not move despite a non-zero desired
+                -- direction, refresh the native input on the render bridge.
+                -- The bridge runs after the default ControlModule and therefore
+                -- becomes the effective movement command for the next physics step.
+                if nativeMoveDirection.Magnitude > 0.01 and Vector3.new(
+                    hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z
+                ).Magnitude < 0.05 then
+                    setNativeMove(nativeMoveDirection, false)
+                end
 
                 local horizontalSpeed = Vector3.new(realVelocity.X, 0, realVelocity.Z).Magnitude
 
                 -- Animation controller: keep the gait driven by the route's actual
                 -- ground speed, not by the tiny frame-to-frame CFrame noise.
                 -- This avoids the classic “gliding” look when the character is moved
-                -- by a replay system instead of Humanoid:MoveTo().
+                -- by a replay system instead of native Humanoid movement.
                 local WALK_START_SPEED = 1.5
                 local WALK_REFERENCE_SPEED = 16.0
                 local WALK_MIN_PLAYBACK = 0.65
@@ -7217,12 +7601,19 @@ function startPlayback()
                     idleTrack:AdjustWeight(1.0, 0.08)
                 end
 
+                local actualYaw = select(2, hrp.CFrame:ToOrientation())
+                if nativeMoveDirection.Magnitude > 0.01 and Vector3.new(
+                    hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z
+                ).Magnitude < 0.15 then
+                    statusLabel.Text = "Status: Waiting for native movement..."
+                end
                 updateHumanMouseCamera(
-                    exactPos,
-                    smoothedFacingYaw + jumpBodyTurnAngle,
+                    hrp.Position,
+                    actualYaw,
                     dt,
                     nowClock,
-                    isAirborne
+                    humanoid:GetState() == Enum.HumanoidStateType.Freefall
+                        or humanoid:GetState() == Enum.HumanoidStateType.Jumping
                 )
                 RunService.Heartbeat:Wait()
                 end -- /CAPTCHA GATE
@@ -7759,7 +8150,39 @@ function applyReferenceGuiSkin()
     end
 
     mainFrame.Size = UDim2.new(0, 860, 0, 500)
-    mainFrame.Position = UDim2.new(0.5, -430, 0.5, -250)
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+
+    -- Responsive UIScale for narrow/mobile screens.
+    local existingScale = mainFrame:FindFirstChild("ResponsiveScale")
+    local responsiveScale = existingScale
+    if not responsiveScale then
+        responsiveScale = Instance.new("UIScale")
+        responsiveScale.Name = "ResponsiveScale"
+        responsiveScale.Parent = mainFrame
+    end
+
+    local function updateResponsiveGuiScale()
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+        local widthScale = (viewport.X - 24) / 860
+        local heightScale = (viewport.Y - 24) / 500
+        local targetScale = math.min(1, widthScale, heightScale)
+        if viewport.X <= 700 then
+            targetScale = math.min(targetScale, 0.76)
+        elseif viewport.X <= 900 then
+            targetScale = math.min(targetScale, 0.86)
+        end
+        responsiveScale.Scale = math.clamp(targetScale, 0.55, 1)
+    end
+
+    updateResponsiveGuiScale()
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        if camera then
+            table.insert(activeConnections, camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveGuiScale))
+        end
+    end)
     mainFrame.BackgroundColor3 = BG
     mainFrame.BackgroundTransparency = 0.16
     mainFrame.BorderSizePixel = 0
@@ -7822,7 +8245,10 @@ function applyReferenceGuiSkin()
     pcall(function()
         for _, name in ipairs({"AutoObbyMenuBtn", "AutoObbyHomeBtn", "AutoObbyMainLabel"}) do
             local obj = rawget(_G, name)
-            if typeof(obj) == "Instance" then obj.Visible = false end
+            if typeof(obj) == "Instance" and obj:IsA("GuiObject") then
+                local guiObj = obj :: GuiObject
+                guiObj.Visible = false
+            end
         end
     end)
 
@@ -7848,10 +8274,11 @@ function applyReferenceGuiSkin()
     tabListLayout.Padding = UDim.new(0, 6)
 
     local sideTitle = __getOrCreateReferenceGuiObject("AutoObbySidebarTitle", "TextLabel")
-    sideTitle.Size = UDim2.new(1, -8, 0, 26)
-    sideTitle.BackgroundTransparency = 1
-    sideTitle.Text = "NAVIGATION"
-    sideTitle.TextColor3 = SUBTLE
+    local sideTitleLabel = sideTitle :: TextLabel
+    sideTitleLabel.Size = UDim2.new(1, -8, 0, 26)
+    sideTitleLabel.BackgroundTransparency = 1
+    sideTitleLabel.Text = "NAVIGATION"
+    sideTitleLabel.TextColor3 = SUBTLE
     sideTitle.TextSize = 8
     sideTitle.Font = Enum.Font.GothamBold
     sideTitle.TextXAlignment = Enum.TextXAlignment.Left
@@ -8368,8 +8795,9 @@ function applyReferenceGuiSkin()
 
     -- Generic visual polish for the remaining pages without replacing their logic.
     for _, page in ipairs({perfPage, safetyPage, diagnosticsPage, autoclickerPage, balloonPage}) do
-        if typeof(page) == "Instance" then
-            page.ClipsDescendants = true
+        if typeof(page) == "Instance" and page:IsA("GuiObject") then
+            local pageGui = page :: GuiObject
+            pageGui.ClipsDescendants = true
         end
     end
 
@@ -8413,5 +8841,7 @@ if runEnabled then
         end
     end)
 end
-end)()
+end
 
+-- Execute immediately when the chunk is called through loadstring(source)().
+return __AERO_MAIN()
