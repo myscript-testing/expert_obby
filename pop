@@ -1828,7 +1828,7 @@ local PHYS = {
     RUN_WALK_SPEED = 54.0,
     RUN_JUMP_HEIGHT = 9.8,
     RUN_GRAVITY = 196.2,
-    SAFETY_MARGIN = 0.94,
+    SAFETY_MARGIN = 0.99,
     telemetryController = nil, -- handle partage (teleport telemetry)
 }
 PHYS.SAFE_HORIZONTAL_SPEED = PHYS.RUN_WALK_SPEED * PHYS.SAFETY_MARGIN
@@ -2225,42 +2225,42 @@ end
 -- Les profils ne déclarent plus un speed_mult brut mais des FRACTIONS de
 -- SAFE_SPEED_LIMIT, converties une seule fois au chargement en vitesses
 -- ABSOLUES (studs/s). La propriété
---     profileMaxSpeed <= 0.985 * SAFE_SPEED_LIMIT < SAFE_SPEED_LIMIT
+--     profileMaxSpeed <= 0.998 * SAFE_SPEED_LIMIT < SAFE_SPEED_LIMIT
 -- est donc garantie mathématiquement pour TOUS les profils (y compris Fast-Safe).
 --   min_speed_fraction / max_speed_fraction : bornes de randomisation par run.
 --   target_speed_fraction                   : vitesse nominale du mode.
 local routeVariants = {
     cautious   = { offset_x = -0.15, offset_z = -0.12, smoothness = 0.88, label = "Cautious (Safe-Slow)",
-        min_speed_fraction = 0.70, max_speed_fraction = 0.76, target_speed_fraction = 0.73 },
+        min_speed_fraction = 0.86, max_speed_fraction = 0.92, target_speed_fraction = 0.90 },
     standard   = { offset_x =  0.00, offset_z =  0.00, smoothness = 1.00, label = "Standard (Nominal)",
-        min_speed_fraction = 0.80, max_speed_fraction = 0.86, target_speed_fraction = 0.83 },
+        min_speed_fraction = 0.91, max_speed_fraction = 0.96, target_speed_fraction = 0.945 },
     lefty      = { offset_x = -0.22, offset_z =  0.08, smoothness = 0.95, label = "Left-Biased (Steady)",
-        min_speed_fraction = 0.79, max_speed_fraction = 0.85, target_speed_fraction = 0.82 },
+        min_speed_fraction = 0.90, max_speed_fraction = 0.95, target_speed_fraction = 0.935 },
     tight      = { offset_x = -0.08, offset_z =  0.12, smoothness = 0.82, label = "Precise-Tight (Trajectory)",
-        min_speed_fraction = 0.82, max_speed_fraction = 0.88, target_speed_fraction = 0.85 },
+        min_speed_fraction = 0.95, max_speed_fraction = 0.985, target_speed_fraction = 0.975 },
     righty     = { offset_x =  0.25, offset_z = -0.10, smoothness = 0.98, label = "Right-Biased (Steady)",
-        min_speed_fraction = 0.83, max_speed_fraction = 0.89, target_speed_fraction = 0.86 },
+        min_speed_fraction = 0.93, max_speed_fraction = 0.98, target_speed_fraction = 0.965 },
     floaty     = { offset_x =  0.05, offset_z = -0.18, smoothness = 1.15, label = "Floaty (Smooth)",
-        min_speed_fraction = 0.85, max_speed_fraction = 0.91, target_speed_fraction = 0.88 },
+        min_speed_fraction = 0.94, max_speed_fraction = 0.985, target_speed_fraction = 0.975 },
     -- Nouveau mode intermédiaire demandé : légèrement au-dessus de Standard,
     -- toujours sous le plafond. (offsets de trajectoire neutres et réduits.)
     balanced   = { offset_x =  0.10, offset_z =  0.05, smoothness = 1.02, label = "Balanced (Brisk)",
-        min_speed_fraction = 0.88, max_speed_fraction = 0.94, target_speed_fraction = 0.91 },
+        min_speed_fraction = 0.95, max_speed_fraction = 0.99, target_speed_fraction = 0.975 },
     -- Ancien "Aggressive" (speed_mult 1.08, hors de tout contrôle) : la FONCTION
     -- (mode le plus rapide) est conservée mais requalifiée "Fast-Safe". Sa bande
-    -- [0.93 ; 0.98] de SAFE_SPEED_LIMIT reste STRICTEMENT sous le plafond, même
+    -- [0.98 ; 0.998] de SAFE_SPEED_LIMIT reste STRICTEMENT sous le plafond, même
     -- au sommet de la randomisation — condition requise pour garder un mode rapide.
     fastsafe   = { offset_x =  0.18, offset_z =  0.14, smoothness = 1.05, label = "Fast-Safe (Peak)",
-        min_speed_fraction = 0.93, max_speed_fraction = 0.98, target_speed_fraction = 0.955 },
+        min_speed_fraction = 0.98, max_speed_fraction = 0.998, target_speed_fraction = 0.99 },
 }
 
 -- Conversion fractions -> vitesses absolues (une seule fois, au chargement) +
 -- nom GUI explicite sur le niveau de vitesse (le nom affiché porte la vitesse réelle).
 for speedGovernorKey, speedGovernorProfile in pairs(routeVariants) do
     speedGovernorProfile.route_key = speedGovernorKey
-    -- Cap à 0.985 : le SOMMET de randomisation de tout profil reste sous le plafond.
-    local fMin = math.clamp(tonumber(speedGovernorProfile.min_speed_fraction) or 0.80, 0.05, 0.985)
-    local fMax = math.clamp(tonumber(speedGovernorProfile.max_speed_fraction) or 0.86, fMin, 0.985)
+    -- Cap à 0.998 : le SOMMET de randomisation reste sous le plafond absolu de 54 studs/s.
+    local fMin = math.clamp(tonumber(speedGovernorProfile.min_speed_fraction) or 0.80, 0.05, 0.998)
+    local fMax = math.clamp(tonumber(speedGovernorProfile.max_speed_fraction) or 0.86, fMin, 0.998)
     local fTgt = math.clamp(tonumber(speedGovernorProfile.target_speed_fraction) or fMin, fMin, fMax)
 
     speedGovernorProfile.min_speed    = SAFE_SPEED_LIMIT * fMin
@@ -2346,7 +2346,7 @@ function validateRouteSpeedProfile(config)
     config.effective_speed = effective
 
     if effective > SAFE_SPEED_LIMIT + 1e-9 then
-        -- Théoriquement inatteignable (bandes capées à 0.985 + clampSpeedMult) :
+        -- Théoriquement inatteignable (bandes capées à 0.998 + clampSpeedMult) :
         -- dernier recours pour garantir la propriété effectiveSpeed <= SAFE_SPEED_LIMIT.
         config.speed_mult = MAX_TIMELINE_SCALE
         config.effective_speed = SAFE_SPEED_LIMIT
