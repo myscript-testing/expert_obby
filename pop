@@ -1782,6 +1782,28 @@ pcall(function()
 end)
 
 -- ========================================================
+-- PHYSICAL GAME CONFIG - HORIZONTAL SPEED GOVERNOR (CANONICAL)
+-- ========================================================
+-- Configuration physique connue du jeu (ne pas modifier sans mesure) :
+--   RunWalkSpeed = 54 | RunJumpHeight = 9.8 | Gravity = 196.2
+-- Le governor NE S'APPLIQUE QU'A LA COMPOSANTE HORIZONTALE (X/Z).
+-- La composante verticale Y (sauts, chutes, gravite) n'est JAMAIS plafonnee :
+-- une grande vitesse verticale n'est PAS un depassement de WalkSpeed.
+--   SAFE_HORIZONTAL_SPEED = RUN_WALK_SPEED * SAFETY_MARGIN
+-- Les frames originales ne sont jamais modifiees ; le plafond est applique
+-- uniquement au point d'application du mouvement (MotionController:apply),
+-- sans compensation/burst a la frame suivante.
+local RUN_WALK_SPEED        = 54.0
+local RUN_JUMP_HEIGHT       = 9.8
+local RUN_GRAVITY           = 196.2
+local SAFETY_MARGIN         = 0.94
+local SAFE_HORIZONTAL_SPEED = RUN_WALK_SPEED * SAFETY_MARGIN
+
+-- Handle partage : les helpers de teleportation (definis avant l'instance du
+-- controleur) peuvent ainsi journaliser la telemetrie live au moment du hop.
+local PlaybackTelemetryHandle = { controller = nil }
+
+-- ========================================================
 -- PLAYBACK MOTION CONTROLLER + TELEMETRY
 -- Centralise l'application du mouvement et calcule des métriques de recherche.
 -- ========================================================
@@ -1797,11 +1819,35 @@ function MotionController.new()
         lastVelocity = Vector3.zero,
         lastYaw = 0,
         samples = 0,
-        maxSpeed = 0,
-        maxAcceleration = 0,
+        sampleIndex = 0,
+        -- Vitesses en studs/s, accelerations en studs/s2.
+        maxSpeed = 0, -- alias de compatibilite = max3DSpeed
+        maxHorizontalSpeed = 0,
+        maxVerticalSpeed = 0, -- max |Y|
+        max3DSpeed = 0,
+        frameIndexMaxHorizontal = 0,
+        frameIndexMaxVertical = 0,
+        frameIndexMax3D = 0,
+        maxAcceleration = 0, -- norme 3D (compatibilite)
+        maxHorizontalAcceleration = 0,
+        maxVerticalAcceleration = 0, -- |Y|
+        frameIndexMaxHorizontalAccel = 0,
+        frameIndexMaxVerticalAccel = 0,
         maxJerk = 0,
+        -- Demande (frames/timeline) vs commande (apres governor) :
+        maxRequestedHorizontal = 0,
+        frameIndexMaxRequested = 0,
+        maxAppliedHorizontal = 0,
+        -- Derive physique entre deux pas precise (commande vs relue) :
+        maxPhysicsDriftH = 0,
+        frameIndexMaxDrift = 0,
+        lastCommanded = nil,
+        clampedSamples = 0,
+        clampActive = false,
+        lastPrecise = nil,
         lastAcceleration = Vector3.zero,
         sumDt = 0,
+        events = {},
     }, MotionController)
 end
 
@@ -1810,29 +1856,115 @@ function MotionController:reset(hrp)
     self.lastVelocity = hrp and hrp.AssemblyLinearVelocity or Vector3.zero
     self.lastYaw = hrp and select(2, hrp.CFrame:ToOrientation()) or 0
     self.samples = 0
+    self.sampleIndex = 0
     self.maxSpeed = 0
+    self.maxHorizontalSpeed = 0
+    self.maxVerticalSpeed = 0
+    self.max3DSpeed = 0
+    self.frameIndexMaxHorizontal = 0
+    self.frameIndexMaxVertical = 0
+    self.frameIndexMax3D = 0
     self.maxAcceleration = 0
+    self.maxHorizontalAcceleration = 0
+    self.maxVerticalAcceleration = 0
+    self.frameIndexMaxHorizontalAccel = 0
+    self.frameIndexMaxVerticalAccel = 0
     self.maxJerk = 0
+    self.maxRequestedHorizontal = 0
+    self.frameIndexMaxRequested = 0
+    self.maxAppliedHorizontal = 0
+    self.maxPhysicsDriftH = 0
+    self.frameIndexMaxDrift = 0
+    self.lastCommanded = nil
+    self.clampedSamples = 0
+    self.clampActive = false
+    self.lastPrecise = nil
     self.lastAcceleration = Vector3.zero
     self.sumDt = 0
+    self.events = {}
 end
 
-function MotionController:apply(hrp, humanoid, position, yaw, dt, shouldJump, preciseReplay)
+-- Point d'application UNIQUE du mouvement.
+-- frameIndex / timelineT sont optionnels (telemetrie) pour rester compatible
+-- avec les anciens appels a 7 arguments.
+function MotionController:apply(hrp, humanoid, position, yaw, dt, shouldJump, preciseReplay, frameIndex, timelineT)
     if not hrp then return Vector3.zero end
     dt = math.max(dt or 1/60, 1/240)
+    frameIndex = tonumber(frameIndex) or 0
+    self.sampleIndex += 1
 
-    local previousPos = self.lastPos or hrp.Position
-    local velocity = (position - previousPos) / dt
-    local acceleration = (velocity - self.lastVelocity) / dt
-    local jerk = (acceleration - self.lastAcceleration) / dt
+    -- Releve "physique" AVANT ecriture : ce que le moteur a reellement apres
+    -- le pas precedent (permet de comparer commande vs observe).
+    local preObserved = hrp.AssemblyLinearVelocity
+    if self.lastCommanded then
+        local drift = preObserved - self.lastCommanded
+        local driftH = Vector3.new(drift.X, 0, drift.Z).Magnitude
+        if driftH > self.maxPhysicsDriftH then
+            self.maxPhysicsDriftH = driftH
+            self.frameIndexMaxDrift = frameIndex
+        end
+    end
 
+    -- 1) Velocite DEMANDEE par la frame (reference timeline, non gouvernee).
+    --    previousRequested suit la trajectoire demandee (pas la cible
+    --    gouvernee) : aucun depassement n'est compense par un burst a la
+    --    frame suivante - la demande reste purement celle de la timeline.
+    local previousRequested = self.lastPos or hrp.Position
+    local requestedVelocity = (position - previousRequested) / dt
+    local requestedH = Vector3.new(requestedVelocity.X, 0, requestedVelocity.Z).Magnitude
+    local requestedV = math.abs(requestedVelocity.Y)
+    local requested3D = requestedVelocity.Magnitude
+    if requestedH > self.maxRequestedHorizontal then
+        self.maxRequestedHorizontal = requestedH
+        self.frameIndexMaxRequested = frameIndex
+    end
+
+    -- 2) Governor HORIZONTAL uniquement : reduction proportionnelle de X/Z.
+    --    Y est recopie tel quel (sauts et trajectoire verticale intacts).
+    --    INTERDIT : math.min(speed3D, 54) sur la norme 3D (ne jamais faire).
+    local governedVelocity = requestedVelocity
+    local clampedThisSample = false
+    if preciseReplay and requestedH > SAFE_HORIZONTAL_SPEED and requestedH > 1e-6 then
+        local s = SAFE_HORIZONTAL_SPEED / requestedH
+        governedVelocity = Vector3.new(
+            requestedVelocity.X * s,
+            requestedVelocity.Y,
+            requestedVelocity.Z * s
+        )
+        clampedThisSample = true
+    end
+
+    local commandedVelocity -- ce qui est effectivement ordonne ce pas
+    local observedVelocity -- ce qui est mesure juste apres application
     if preciseReplay then
-        -- Exact trajectory is reserved for complex multi-stage movement.
+        -- Trajectoire exacte reservee aux mouvements complexes multi-etapes.
         setNativeMove(Vector3.zero, false)
-        hrp.CFrame = CFrame.new(position) * CFrame.Angles(0, yaw, 0)
-        hrp.AssemblyLinearVelocity = velocity
+        -- Le pas CFrame lui-meme est gouverne : teleporter `position` en brut
+        -- serait un spike horizontal (ex. snap de rattrapage de 3+ studs en
+        -- 1 frame ~= 190+ studs/s). On limite le deplacement horizontal a ce
+        -- que SAFE_HORIZONTAL_SPEED autorise pendant ce dt ; le deplacement
+        -- vertical est applique en totalite. Le retard eventuel est accepte
+        -- (pas de rattrapage) : lastPos reste la reference timeline.
+        local displacement = position - hrp.Position
+        local flatDisp = Vector3.new(displacement.X, 0, displacement.Z)
+        local maxStep = SAFE_HORIZONTAL_SPEED * dt
+        local governedTarget = position
+        if flatDisp.Magnitude > maxStep and flatDisp.Magnitude > 1e-6 then
+            local s = maxStep / flatDisp.Magnitude
+            governedTarget = Vector3.new(
+                hrp.Position.X + displacement.X * s,
+                position.Y,
+                hrp.Position.Z + displacement.Z * s
+            )
+            clampedThisSample = true
+        end
+        hrp.CFrame = CFrame.new(governedTarget) * CFrame.Angles(0, yaw, 0)
+        hrp.AssemblyLinearVelocity = governedVelocity
+        commandedVelocity = governedVelocity
+        observedVelocity = hrp.AssemblyLinearVelocity -- relecture immediate
+        self.lastCommanded = commandedVelocity
     else
-        -- Ordinary traversal stays on the real Humanoid movement stack.
+        -- Traversee ordinaire sur la vraie pile de mouvement Humanoid.
         local delta = position - hrp.Position
         local horizontal = Vector3.new(delta.X, 0, delta.Z)
         if horizontal.Magnitude > 0.05 then
@@ -1843,46 +1975,392 @@ function MotionController:apply(hrp, humanoid, position, yaw, dt, shouldJump, pr
         if shouldJump then
             pcall(function() humanoid.Jump = true end)
         end
-        velocity = hrp.AssemblyLinearVelocity
-        acceleration = (velocity - self.lastVelocity) / dt
-        jerk = (acceleration - self.lastAcceleration) / dt
+        -- En mode natif, la velocite est celle de la physique (Humanoid deja
+        -- borne par le WalkSpeed du jeu) : on l'observe, on ne la gouverne pas.
+        commandedVelocity = nil
+        observedVelocity = hrp.AssemblyLinearVelocity
+        self.lastCommanded = nil
     end
 
-    local speed = velocity.Magnitude
-    self.maxSpeed = math.max(self.maxSpeed, speed)
+    -- Episodes de clamp (rising/falling edge uniquement, anti-spam console).
+    if clampedThisSample then
+        self.clampedSamples += 1
+        if not self.clampActive then
+            self.clampActive = true
+            self:noteEvent("hclamp_start", {
+                frame = frameIndex, t = timelineT,
+                detail = string.format("reqH=%.1f->govH=%.1f (safe=%.1f) reqV=%.1f req3D=%.1f",
+                    requestedH,
+                    Vector3.new(commandedVelocity.X, 0, commandedVelocity.Z).Magnitude,
+                    SAFE_HORIZONTAL_SPEED, requestedV, requested3D),
+            })
+        end
+    elseif self.clampActive then
+        self.clampActive = false
+        self:noteEvent("hclamp_end", { frame = frameIndex, t = timelineT })
+    end
+
+    -- Transitions native <-> precise (source suspecte n.1 des spikes 36->100+).
+    if self.lastPrecise ~= nil and preciseReplay ~= self.lastPrecise then
+        self:noteEvent(preciseReplay and "native_to_precise" or "precise_to_native", {
+            frame = frameIndex, t = timelineT,
+            detail = string.format("reqH=%.1f reqV=%.1f req3D=%.1f obsH=%.1f obsV=%.1f",
+                requestedH, requestedV, requested3D,
+                Vector3.new(observedVelocity.X, 0, observedVelocity.Z).Magnitude,
+                math.abs(observedVelocity.Y)),
+        })
+    end
+    self.lastPrecise = preciseReplay
+
+    -- Metriques : TOUT est split horizontal / vertical / 3D. Une grande
+    -- vitesse verticale (saut/chute) n'est jamais un depassement WalkSpeed.
+    local velocity = observedVelocity
+    local acceleration = (velocity - self.lastVelocity) / dt
+    local jerk = (acceleration - self.lastAcceleration) / dt
+    local hSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local vSpeed = math.abs(velocity.Y)
+    local s3d = velocity.Magnitude
+    local hAccel = Vector3.new(acceleration.X, 0, acceleration.Z).Magnitude
+    local vAccel = math.abs(acceleration.Y)
+    if hSpeed > self.maxHorizontalSpeed then
+        self.maxHorizontalSpeed = hSpeed
+        self.frameIndexMaxHorizontal = frameIndex
+    end
+    if vSpeed > self.maxVerticalSpeed then
+        self.maxVerticalSpeed = vSpeed
+        self.frameIndexMaxVertical = frameIndex
+    end
+    if s3d > self.max3DSpeed then
+        self.max3DSpeed = s3d
+        self.frameIndexMax3D = frameIndex
+    end
+    self.maxSpeed = self.max3DSpeed -- alias compatibilite
+    if hAccel > self.maxHorizontalAcceleration then
+        self.maxHorizontalAcceleration = hAccel
+        self.frameIndexMaxHorizontalAccel = frameIndex
+    end
+    if vAccel > self.maxVerticalAcceleration then
+        self.maxVerticalAcceleration = vAccel
+        self.frameIndexMaxVerticalAccel = frameIndex
+    end
     self.maxAcceleration = math.max(self.maxAcceleration, acceleration.Magnitude)
     self.maxJerk = math.max(self.maxJerk, jerk.Magnitude)
+    if commandedVelocity then
+        local cmdH = Vector3.new(commandedVelocity.X, 0, commandedVelocity.Z).Magnitude
+        if cmdH > self.maxAppliedHorizontal then
+            self.maxAppliedHorizontal = cmdH
+        end
+    else
+        -- Mode natif : l'observe EST l'applique (physique du jeu).
+        if hSpeed > self.maxAppliedHorizontal then
+            self.maxAppliedHorizontal = hSpeed
+        end
+    end
     self.samples += 1
     self.sumDt += dt
-    self.lastPos = position
+    self.lastPos = position -- reference timeline (PAS la cible gouvernee)
     self.lastVelocity = velocity
     self.lastAcceleration = acceleration
     self.lastYaw = yaw or self.lastYaw
     return velocity
 end
 
+-- Journal d'evenements bas debit : transitions native/precise, clamp,
+-- jumps, apex, landing, fin de replay, teleportations. Cape a 128 entrees.
+function MotionController:noteEvent(tag, data)
+    data = data or {}
+    self.events = self.events or {}
+    if #self.events >= 128 then
+        table.remove(self.events, 1)
+    end
+    local entry = {
+        tag = tostring(tag),
+        sample = self.sampleIndex or 0,
+        frame = tonumber(data.frame) or 0,
+        t = data.t,
+        detail = tostring(data.detail or ""),
+    }
+    self.events[#self.events + 1] = entry
+    warn(string.format("[PlaybackEvent] %s sample=%d frame=%d t=%s %s",
+        entry.tag, entry.sample, entry.frame,
+        entry.t ~= nil and string.format("%.3f", tonumber(entry.t) or 0) or "-",
+        entry.detail))
+end
+
 function MotionController:report(prefix)
-    return string.format(
-        "%s samples=%d avgDt=%.4f maxSpeed=%.2f maxAccel=%.2f maxJerk=%.2f",
-        prefix or "[Motion]", self.samples,
-        self.samples > 0 and (self.sumDt / self.samples) or 0,
-        self.maxSpeed, self.maxAcceleration, self.maxJerk
-    )
+    local lines = {}
+    lines[#lines + 1] = tostring(prefix or "[PlaybackTelemetry]")
+    lines[#lines + 1] = string.format("horizontalMax=%.2f", self.maxHorizontalSpeed or 0)
+    lines[#lines + 1] = string.format("verticalMax=%.2f", self.maxVerticalSpeed or 0)
+    lines[#lines + 1] = string.format("3DMax=%.2f", self.max3DSpeed or 0)
+    lines[#lines + 1] = string.format("frameHorizontalMax=%d", self.frameIndexMaxHorizontal or 0)
+    lines[#lines + 1] = string.format("frame3DMax=%d", self.frameIndexMax3D or 0)
+    lines[#lines + 1] = string.format("maxHorizontalAccel=%.2f", self.maxHorizontalAcceleration or 0)
+    lines[#lines + 1] = string.format("maxVerticalAccel=%.2f", self.maxVerticalAcceleration or 0)
+    -- Contexte demande vs observe (diagnostic 36 -> 100+) :
+    lines[#lines + 1] = string.format("frameVerticalMax=%d", self.frameIndexMaxVertical or 0)
+    lines[#lines + 1] = string.format("frameHorizontalAccelMax=%d", self.frameIndexMaxHorizontalAccel or 0)
+    lines[#lines + 1] = string.format("frameVerticalAccelMax=%d", self.frameIndexMaxVerticalAccel or 0)
+    lines[#lines + 1] = string.format("requestedHorizontalMax=%.2f (frame %d)",
+        self.maxRequestedHorizontal or 0, self.frameIndexMaxRequested or 0)
+    lines[#lines + 1] = string.format("appliedHorizontalMax=%.2f", self.maxAppliedHorizontal or 0)
+    lines[#lines + 1] = string.format("physicsDriftHMax=%.2f (frame %d)",
+        self.maxPhysicsDriftH or 0, self.frameIndexMaxDrift or 0)
+    lines[#lines + 1] = string.format("clampedSamples=%d/%d safeHorizontal=%.2f (RUN_WALK_SPEED=%.1f x margin=%.2f)",
+        self.clampedSamples or 0, self.samples or 0,
+        SAFE_HORIZONTAL_SPEED, RUN_WALK_SPEED, SAFETY_MARGIN)
+    lines[#lines + 1] = string.format("samples=%d avgDt=%.4f maxJerk=%.2f",
+        self.samples or 0,
+        (self.samples or 0) > 0 and ((self.sumDt or 0) / self.samples) or 0,
+        self.maxJerk or 0)
+    return table.concat(lines, "\n")
+end
+
+-- Telemetrie juste avant/apres TeleportService. Fonction GLOBALE (resolue au
+-- runtime) car les helpers de hop/reconnect sont definis avant l'instance.
+function noteTeleportTelemetry(phase, where)
+    local ctrl = PlaybackTelemetryHandle and PlaybackTelemetryHandle.controller
+    local summary = "controller=nil"
+    if ctrl then
+        local ok, rep = pcall(function()
+            return ctrl:report("[PlaybackTelemetry][teleport:" .. tostring(phase) .. "]")
+        end)
+        if ok and type(rep) == "string" then
+            summary = rep
+        end
+    end
+    warn(string.format("[TeleportTelemetry] phase=%s where=%s clock=%.3f\n%s",
+        tostring(phase), tostring(where), os.clock(), summary))
+    if ctrl and type(ctrl.noteEvent) == "function" then
+        pcall(function()
+            ctrl:noteEvent("teleport_" .. tostring(phase), { detail = tostring(where) })
+        end)
+    end
 end
 
 -- ================= [ PRE-GENERATED MULTI-ROUTE SYSTEM ] =================
 -- Toutes les variations de trajectoire sont générées une seule fois par route.
 -- Aucun math.random() n'est exécuté dans la boucle Heartbeat pour la position.
 
+-- ================= [ CENTRAL SPEED GOVERNOR ] =================
+-- Toute la chaine de vitesse est derivee de la configuration physique
+-- canonique (RUN_WALK_SPEED / SAFETY_MARGIN / SAFE_HORIZONTAL_SPEED, definie
+-- avant MotionController). Les noms historiques ci-dessous sont des ALIAS de
+-- l'enveloppe HORIZONTALE. La verticale n'est jamais plafonnee.
+--   SPEED_LIMIT      : alias de RUN_WALK_SPEED (54 studs/s nominaux).
+--   SPEED_MARGIN     : alias de SAFETY_MARGIN (0 < marge <= 1).
+--   SAFE_SPEED_LIMIT : alias de SAFE_HORIZONTAL_SPEED, plafond horizontal
+--                      reellement applique ; aucun mode, aucune randomisation,
+--                      aucun fallback ne le depasse sur X/Z.
+local SPEED_LIMIT       = RUN_WALK_SPEED
+local SPEED_MARGIN      = SAFETY_MARGIN
+local SAFE_SPEED_LIMIT  = SAFE_HORIZONTAL_SPEED
+
+-- Vitesse nominale a laquelle la timeline de reference (table frames) est
+-- interpretee. Jouer la timeline a un multiplicateur m donne une vitesse
+-- monde horizontale effective ~ BASE_REPLAY_SPEED * m : c'est la definition
+-- utilisee ci-dessous. (Ancienne valeur 16.0 invalide pour ce jeu a 54.)
+local BASE_REPLAY_SPEED = RUN_WALK_SPEED
+
+-- Bornes globales du multiplicateur de timeline, DÉRIVÉES de la limite absolue.
+local MAX_TIMELINE_SCALE  = SAFE_SPEED_LIMIT / BASE_REPLAY_SPEED
+local MIN_EFFECTIVE_SPEED = SAFE_SPEED_LIMIT * 0.60           -- plancher absolu anti-valeur absurde
+local MIN_TIMELINE_SCALE  = MIN_EFFECTIVE_SPEED / BASE_REPLAY_SPEED
+
+-- Convertit un multiplicateur de timeline vers l'enveloppe globale dérivée de
+-- SAFE_SPEED_LIMIT. Dernier recours mathématique : m * BASE_REPLAY_SPEED <= SAFE_SPEED_LIMIT.
+local function clampSpeedMult(mult)
+    return math.clamp(tonumber(mult) or MIN_TIMELINE_SCALE, MIN_TIMELINE_SCALE, MAX_TIMELINE_SCALE)
+end
+
+-- Borne une vitesse absolue (studs/s) dans l'enveloppe autorisée.
+local function clampEffectiveSpeed(speed)
+    return math.clamp(tonumber(speed) or MIN_EFFECTIVE_SPEED, MIN_EFFECTIVE_SPEED, SAFE_SPEED_LIMIT)
+end
+
+-- Les profils ne déclarent plus un speed_mult brut mais des FRACTIONS de
+-- SAFE_SPEED_LIMIT, converties une seule fois au chargement en vitesses
+-- ABSOLUES (studs/s). La propriété
+--     profileMaxSpeed <= 0.985 * SAFE_SPEED_LIMIT < SAFE_SPEED_LIMIT
+-- est donc garantie mathématiquement pour TOUS les profils (y compris Fast-Safe).
+--   min_speed_fraction / max_speed_fraction : bornes de randomisation par run.
+--   target_speed_fraction                   : vitesse nominale du mode.
 local routeVariants = {
-    standard   = { offset_x = 0.00, offset_z = 0.00, speed_mult = 1.00, smoothness = 1.00, name = "Standard" },
-    cautious   = { offset_x = -0.15, offset_z = -0.12, speed_mult = 0.92, smoothness = 0.88, name = "Cautious" },
-    aggressive = { offset_x = 0.18, offset_z = 0.14, speed_mult = 1.08, smoothness = 1.05, name = "Aggressive" },
-    lefty      = { offset_x = -0.22, offset_z = 0.08, speed_mult = 0.96, smoothness = 0.95, name = "Left-Biased" },
-    righty     = { offset_x = 0.25, offset_z = -0.10, speed_mult = 1.04, smoothness = 0.98, name = "Right-Biased" },
-    floaty     = { offset_x = 0.05, offset_z = -0.18, speed_mult = 1.02, smoothness = 1.15, name = "Floaty" },
-    tight      = { offset_x = -0.08, offset_z = 0.12, speed_mult = 0.98, smoothness = 0.82, name = "Tight" },
+    cautious   = { offset_x = -0.15, offset_z = -0.12, smoothness = 0.88, label = "Cautious (Safe-Slow)",
+        min_speed_fraction = 0.70, max_speed_fraction = 0.76, target_speed_fraction = 0.73 },
+    standard   = { offset_x =  0.00, offset_z =  0.00, smoothness = 1.00, label = "Standard (Nominal)",
+        min_speed_fraction = 0.80, max_speed_fraction = 0.86, target_speed_fraction = 0.83 },
+    lefty      = { offset_x = -0.22, offset_z =  0.08, smoothness = 0.95, label = "Left-Biased (Steady)",
+        min_speed_fraction = 0.79, max_speed_fraction = 0.85, target_speed_fraction = 0.82 },
+    tight      = { offset_x = -0.08, offset_z =  0.12, smoothness = 0.82, label = "Precise-Tight (Trajectory)",
+        min_speed_fraction = 0.82, max_speed_fraction = 0.88, target_speed_fraction = 0.85 },
+    righty     = { offset_x =  0.25, offset_z = -0.10, smoothness = 0.98, label = "Right-Biased (Steady)",
+        min_speed_fraction = 0.83, max_speed_fraction = 0.89, target_speed_fraction = 0.86 },
+    floaty     = { offset_x =  0.05, offset_z = -0.18, smoothness = 1.15, label = "Floaty (Smooth)",
+        min_speed_fraction = 0.85, max_speed_fraction = 0.91, target_speed_fraction = 0.88 },
+    -- Nouveau mode intermédiaire demandé : légèrement au-dessus de Standard,
+    -- toujours sous le plafond. (offsets de trajectoire neutres et réduits.)
+    balanced   = { offset_x =  0.10, offset_z =  0.05, smoothness = 1.02, label = "Balanced (Brisk)",
+        min_speed_fraction = 0.88, max_speed_fraction = 0.94, target_speed_fraction = 0.91 },
+    -- Ancien "Aggressive" (speed_mult 1.08, hors de tout contrôle) : la FONCTION
+    -- (mode le plus rapide) est conservée mais requalifiée "Fast-Safe". Sa bande
+    -- [0.93 ; 0.98] de SAFE_SPEED_LIMIT reste STRICTEMENT sous le plafond, même
+    -- au sommet de la randomisation — condition requise pour garder un mode rapide.
+    fastsafe   = { offset_x =  0.18, offset_z =  0.14, smoothness = 1.05, label = "Fast-Safe (Peak)",
+        min_speed_fraction = 0.93, max_speed_fraction = 0.98, target_speed_fraction = 0.955 },
 }
+
+-- Conversion fractions -> vitesses absolues (une seule fois, au chargement) +
+-- nom GUI explicite sur le niveau de vitesse (le nom affiché porte la vitesse réelle).
+for speedGovernorKey, speedGovernorProfile in pairs(routeVariants) do
+    speedGovernorProfile.route_key = speedGovernorKey
+    -- Cap à 0.985 : le SOMMET de randomisation de tout profil reste sous le plafond.
+    local fMin = math.clamp(tonumber(speedGovernorProfile.min_speed_fraction) or 0.80, 0.05, 0.985)
+    local fMax = math.clamp(tonumber(speedGovernorProfile.max_speed_fraction) or 0.86, fMin, 0.985)
+    local fTgt = math.clamp(tonumber(speedGovernorProfile.target_speed_fraction) or fMin, fMin, fMax)
+
+    speedGovernorProfile.min_speed    = SAFE_SPEED_LIMIT * fMin
+    speedGovernorProfile.max_speed    = SAFE_SPEED_LIMIT * fMax
+    speedGovernorProfile.target_speed = SAFE_SPEED_LIMIT * fTgt
+    speedGovernorProfile.name = string.format(
+        "%s · %.1f st/s", tostring(speedGovernorProfile.label or speedGovernorKey),
+        speedGovernorProfile.target_speed
+    )
+end
+
+-- ================= [ SPEED PROFILE VALIDATION ] =================
+-- Vérifie — et corrige AUTOMATIQUEMENT avant tout usage — :
+--   1. vitesse minimale ; 2. vitesse maximale ; 3. vitesse effective finale ;
+--   4. limite globale ;   5. marge de sécurité ;   6. speed_mult avant/après clamp.
+function validateRouteSpeedProfile(config)
+    if type(config) ~= "table" then return config end
+    local corrected = false
+
+    -- 5) Marge de sécurité + 4) limite globale (recalcul défensif).
+    local margin = tonumber(SPEED_MARGIN)
+    if not margin or margin <= 0 or margin > 1 then
+        SPEED_MARGIN = 1.0
+        corrected = true
+    end
+    local safeLimit = SPEED_LIMIT * SPEED_MARGIN
+    if not (safeLimit > 0) then
+        SPEED_LIMIT, SPEED_MARGIN, safeLimit = RUN_WALK_SPEED, 1.0, RUN_WALK_SPEED
+        corrected = true
+    end
+    if math.abs(safeLimit - SAFE_SPEED_LIMIT) > 1e-9 then
+        SAFE_SPEED_LIMIT = safeLimit
+        SAFE_HORIZONTAL_SPEED = safeLimit -- garder le canonique synchronise
+        MAX_TIMELINE_SCALE = SAFE_SPEED_LIMIT / BASE_REPLAY_SPEED
+        corrected = true
+    end
+
+    -- Référentiel de repli si un champ manque (config étrangère/héritée).
+    local fallback = routeVariants.standard
+    local defLo = fallback and fallback.min_speed or SAFE_SPEED_LIMIT * 0.80
+    local defHi = fallback and fallback.max_speed or SAFE_SPEED_LIMIT * 0.86
+
+    -- 1) 2) Bornes absolues du profil (studs/s).
+    local lo = tonumber(config.min_speed) or defLo
+    local hi = tonumber(config.max_speed) or defHi
+    if lo > hi then lo, hi = hi, lo end
+    lo = math.max(lo, MIN_EFFECTIVE_SPEED)
+    hi = math.max(hi, MIN_EFFECTIVE_SPEED)
+    local cappedHi = math.min(hi, SAFE_SPEED_LIMIT)          -- 4) plafond global
+    if cappedHi ~= hi then corrected = true end
+    hi = cappedHi
+    if lo > hi then lo = hi end
+
+    if config.min_speed ~= lo then config.min_speed = lo; corrected = true end
+    if config.max_speed ~= hi then config.max_speed = hi; corrected = true end
+
+    local target = tonumber(config.target_speed) or (lo + hi) * 0.5
+    target = math.clamp(target, lo, hi)
+    if config.target_speed ~= target then config.target_speed = target; corrected = true end
+
+    -- 6) speed_mult AVANT/APRÈS clamp. Une initialisation (champ absent) n'est
+    -- pas une correction : seul un écart réel marque `corrected`.
+    local multBefore = tonumber(config.speed_mult) or (target / BASE_REPLAY_SPEED)
+    local multAfter = clampSpeedMult(multBefore)
+    if config.speed_mult_before_clamp == nil then
+        config.speed_mult_before_clamp = multBefore
+    elseif config.speed_mult_before_clamp ~= multBefore then
+        config.speed_mult_before_clamp = multBefore
+        corrected = true
+    end
+    if config.speed_mult == nil then
+        config.speed_mult = multAfter
+    elseif config.speed_mult ~= multAfter then
+        config.speed_mult = multAfter
+        corrected = true
+    end
+
+    -- 3) Vitesse effective FINALE, resynchronisée sur le mult clampé.
+    local effective = multAfter * BASE_REPLAY_SPEED
+    config.min_scale = clampSpeedMult(lo / BASE_REPLAY_SPEED)
+    config.max_scale = clampSpeedMult(hi / BASE_REPLAY_SPEED)
+    config.selected_speed = math.clamp(effective, lo, hi)
+    config.effective_speed = effective
+
+    if effective > SAFE_SPEED_LIMIT + 1e-9 then
+        -- Théoriquement inatteignable (bandes capées à 0.985 + clampSpeedMult) :
+        -- dernier recours pour garantir la propriété effectiveSpeed <= SAFE_SPEED_LIMIT.
+        config.speed_mult = MAX_TIMELINE_SCALE
+        config.effective_speed = SAFE_SPEED_LIMIT
+        config.selected_speed = SAFE_SPEED_LIMIT
+        corrected = true
+    end
+
+    config.speed_governor_ok = true
+    if corrected then
+        config.speed_governor_corrected = true
+        warn(string.format(
+            "[SpeedProfile] Config corrigée automatiquement avant usage: %s (effective=%.2f <= SAFE=%.2f)",
+            tostring(config.name or config.route_key or "?"), config.effective_speed, SAFE_SPEED_LIMIT
+        ))
+    end
+    return config
+end
+
+-- Logging de démarrage de route. La validation/auto-correction a déjà tourné :
+-- on n'affiche JAMAIS une configuration dont la vitesse effective dépasse
+-- SAFE_SPEED_LIMIT (dans ce cas impossible, la route est refusée en warn).
+function logSpeedProfile(config, routeKey)
+    config = validateRouteSpeedProfile(config)
+    local effective = tonumber(config.effective_speed) or 0
+    if effective > SAFE_SPEED_LIMIT + 1e-9 then
+        warn(string.format(
+            "[SpeedProfile] REFUSED %s: effective %.2f > SAFE %.2f — config not started.",
+            tostring(routeKey or config.name or "?"), effective, SAFE_SPEED_LIMIT
+        ))
+        return
+    end
+
+    print(string.format(
+        "[SpeedProfile]\n" ..
+        "Mode: %s\n" ..
+        "Target: %.2f studs/s\n" ..
+        "Limit: %.2f studs/s\n" ..
+        "Margin: %.1f%% (safe limit: %.2f studs/s)\n" ..
+        "Effective: %.2f studs/s (%.1f%% of limit)\n" ..
+        "Band: [%.2f ; %.2f] studs/s | timeline mult: %.3f (max %.3f)",
+        tostring(config.name or routeKey or "?"),
+        tonumber(config.target_speed) or 0,
+        SPEED_LIMIT,
+        SPEED_MARGIN * 100,
+        SAFE_SPEED_LIMIT,
+        effective,
+        SAFE_SPEED_LIMIT > 0 and (effective / SAFE_SPEED_LIMIT) * 100 or 0,
+        tonumber(config.min_speed) or 0,
+        tonumber(config.max_speed) or 0,
+        tonumber(config.speed_mult) or 0,
+        tonumber(config.max_scale) or MAX_TIMELINE_SCALE
+    ))
+end
+
+-- Validation de charge : tous les profils passent par la validation dès le démarrage.
+for _, speedGovernorProfile in pairs(routeVariants) do
+    validateRouteSpeedProfile(speedGovernorProfile)
+end
 
 local currentRoute = nil
 local runCounter = 0
@@ -1913,25 +2391,49 @@ function randomFloat(minValue, maxValue)
 end
 
 -- Chaque run reçoit sa propre variante autour des valeurs d'origine.
--- Les écarts restent volontairement faibles pour conserver le profil de chaque mode.
+-- RANDOMISATION BORNÉE : elle est tirée DANS la bande du profil sélectionné,
+-- elle-même intersection (profil ∩ enveloppe globale) :
+--     profileMinSpeed <= selectedSpeed <= profileMaxSpeed <= SAFE_SPEED_LIMIT
 function randomizeRouteConfig(base, routeKey)
     runCounter += 1
 
+    -- Le profil de base est validé/corrigé avant tout tirage.
+    local profile = validateRouteSpeedProfile(base)
+
+    local bandMin = math.max(profile.min_speed, MIN_EFFECTIVE_SPEED)
+    local bandMax = math.min(profile.max_speed, SAFE_SPEED_LIMIT)
+    if bandMax < bandMin then
+        bandMin, bandMax = bandMax, bandMin
+    end
+
+    -- Tirage DANS les limites du profil, puis clamp défensif global (redondant
+    -- par construction, mais aucune valeur ne peut sortir de l'enveloppe).
+    local selectedSpeed = clampEffectiveSpeed(randomFloat(bandMin, bandMax))
+    local speedMultBeforeClamp = selectedSpeed / BASE_REPLAY_SPEED
+
     local cfg = {
-        base_name = base.name,
-        name = base.name,
-        offset_x = base.offset_x + randomFloat(-0.045, 0.045),
-        offset_z = base.offset_z + randomFloat(-0.045, 0.045),
-        speed_mult = math.clamp(base.speed_mult + randomFloat(-0.025, 0.025), 0.88, 1.12),
-        smoothness = math.clamp(base.smoothness + randomFloat(-0.035, 0.035), 0.75, 1.20),
+        base_name = profile.name,
+        name = profile.name,
+        offset_x = profile.offset_x + randomFloat(-0.045, 0.045),
+        offset_z = profile.offset_z + randomFloat(-0.045, 0.045),
+        smoothness = math.clamp(profile.smoothness + randomFloat(-0.035, 0.035), 0.75, 1.20),
         seed = randomFloat(-5000, 5000),
         jitter_phase_x = randomFloat(0, math.pi * 2),
         jitter_phase_z = randomFloat(0, math.pi * 2),
         run_id = runCounter,
         route_key = routeKey,
+
+        -- ---- Gouvernail de vitesse (studs/s absolus + mult dérivé) ----
+        target_speed = profile.target_speed,
+        min_speed = bandMin,
+        max_speed = bandMax,
+        selected_speed = selectedSpeed,
+        speed_mult_before_clamp = speedMultBeforeClamp,
+        speed_mult = clampSpeedMult(speedMultBeforeClamp),
     }
 
-    return cfg
+    -- Validation finale de l'instance (resynchronise effective_speed/min_scale/max_scale).
+    return validateRouteSpeedProfile(cfg)
 end
 
 function generateHumanCameraProfile()
@@ -2139,11 +2641,22 @@ function generateTimingProfile(baseFrames, route)
     local keys = table.create(segmentCount)
     local seedBase = route.seed or 0
 
+    -- Bande de timing = bande du profil (déjà validée <= SAFE_SPEED_LIMIT).
+    -- Le wobble aléatoire NE PEUT PLUS pousser la vitesse hors du profil ni
+    -- au-delà du plafond global : chaque clé est clampée à la génération.
+    local routeMult = clampSpeedMult(route.speed_mult)
+    local scaleMin = clampSpeedMult((tonumber(route.min_speed) or SAFE_SPEED_LIMIT * 0.80) / BASE_REPLAY_SPEED)
+    local scaleMax = clampSpeedMult((tonumber(route.max_speed) or SAFE_SPEED_LIMIT * 0.86) / BASE_REPLAY_SPEED)
+    if scaleMax < scaleMin then
+        scaleMin, scaleMax = scaleMax, scaleMin
+    end
+    scaleMax = math.min(scaleMax, MAX_TIMELINE_SCALE)
+
     for i = 1, segmentCount do
         local progress = (i - 1) / math.max(1, segmentCount - 1)
         local natural = math.sin(progress * math.pi)
         local wobble = (hashNoise1D(i, 91.7 + seedBase) - 0.5) * 0.045 * natural
-        keys[i] = route.speed_mult * (1 + wobble)
+        keys[i] = math.clamp(routeMult * (1 + wobble), scaleMin, scaleMax)
     end
 
     for i = 1, #baseFrames do
@@ -2168,6 +2681,16 @@ function generateTimingProfile(baseFrames, route)
                 profile[n] = profile[n] * (1 - (1 - commitScale) * taper)
             end
         end
+    end
+
+    -- Garantie absolue : aucun échantillon du timing ne peut sortir de
+    -- [MIN_TIMELINE_SCALE ; scaleMax] (scaleMax <= MAX_TIMELINE_SCALE, donc
+    -- scaleMax * BASE_REPLAY_SPEED <= SAFE_SPEED_LIMIT). Le ralentissement
+    -- d'approche des sauts n'est JAMAIS compensé ensuite : la timeline est
+    -- intégrée (pas mappée sur l'horloge murale), donc réduire la vitesse
+    -- n'induit aucun burst de rattrapage — la durée réelle s'allonge, point.
+    for i = 1, #profile do
+        profile[i] = math.clamp(profile[i], MIN_TIMELINE_SCALE, scaleMax)
     end
 
     return profile
@@ -2516,9 +3039,13 @@ function performServerHop()
         saveSettings()
 
         if targetServerId then
+            noteTeleportTelemetry("before", "ServerHop:TeleportToPlaceInstance")
             TeleportService:TeleportToPlaceInstance(placeId, targetServerId, LocalPlayer)
+            noteTeleportTelemetry("after", "ServerHop:TeleportToPlaceInstance")
         else
+            noteTeleportTelemetry("before", "ServerHop:Teleport")
             TeleportService:Teleport(placeId, LocalPlayer)
+            noteTeleportTelemetry("after", "ServerHop:Teleport")
         end
     end)
 end
@@ -2532,6 +3059,7 @@ function performReconnect()
     task.spawn(function()
         while isRunningScript do
             task.wait(3.5)
+            noteTeleportTelemetry("before", "Reconnect:loop")
             local success, _ = pcall(function()
                 if #Players:GetPlayers() <= 1 then
                     TeleportService:Teleport(game.PlaceId, LocalPlayer)
@@ -2539,11 +3067,14 @@ function performReconnect()
                     TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
                 end
             end)
-            
+            noteTeleportTelemetry("after", "Reconnect:loop")
+
             if not success then
+                noteTeleportTelemetry("before", "Reconnect:fallback")
                 pcall(function()
                     TeleportService:Teleport(game.PlaceId, LocalPlayer)
                 end)
+                noteTeleportTelemetry("after", "Reconnect:fallback")
             end
             task.wait(4.5)
         end
@@ -2588,7 +3119,9 @@ pcall(function()
     local tpFailConn = TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
         if autoReconnectEnabled and isRunningScript and player == LocalPlayer then
             task.wait(3)
+            noteTeleportTelemetry("before", "TeleportInitFailed")
             TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            noteTeleportTelemetry("after", "TeleportInitFailed")
         end
     end)
     table.insert(activeConnections, tpFailConn)
@@ -2609,7 +3142,9 @@ pcall(function()
                 
                 if isCreator or isGroupAdmin then
                     warn(string.format("[StaffEvade] Staff member detected (%s). Auto-hopping server...", player.Name))
+                    noteTeleportTelemetry("before", "StaffEvade")
                     TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                    noteTeleportTelemetry("after", "StaffEvade")
                 end
             end)
         end)
@@ -7036,11 +7571,19 @@ local function runCheckpointRoute(character, humanoid, hrp, definition, routeNam
 
         -- Vary only the movement speed for this checkpoint segment;
         -- the chosen path itself is still whatever PathfindingService resolves.
-        local nativeBaseSpeed = math.max(1, tonumber(originalWalkSpeed) or 16)
-        local lowerNativeSpeed = math.max(1, nativeBaseSpeed * 0.97)
-        local upperNativeSpeed = math.max(lowerNativeSpeed, nativeBaseSpeed * 1.04)
+        local nativeBaseSpeed = math.max(1, tonumber(originalWalkSpeed) or RUN_WALK_SPEED)
+        -- Gouvernail de vitesse : toute la bande de variation WalkSpeed reste
+        -- sous SAFE_HORIZONTAL_SPEED (le x1.04 sur 54 atteindrait 56.16 > 54).
+        local lowerNativeSpeed = math.clamp(
+            math.min(nativeBaseSpeed * 0.97, SAFE_HORIZONTAL_SPEED * 0.97), 1, SAFE_HORIZONTAL_SPEED
+        )
+        local upperNativeSpeed = math.clamp(
+            math.max(lowerNativeSpeed, nativeBaseSpeed * 1.04), lowerNativeSpeed, SAFE_HORIZONTAL_SPEED
+        )
         local segmentSpeed = lowerNativeSpeed
             + (upperNativeSpeed - lowerNativeSpeed) * math.random()
+        -- Clamp absolu au point d'usage (le seul endroit ou WalkSpeed est pose).
+        segmentSpeed = math.clamp(segmentSpeed, 1, SAFE_HORIZONTAL_SPEED)
         pcall(function() humanoid.WalkSpeed = segmentSpeed end)
 
         local angle = math.random() * math.pi * 2
@@ -7143,7 +7686,10 @@ function startPlayback()
             end
 
             local selectedRouteConfig, routeName = selectRandomRoute()
-            local routeConfig = selectedRouteConfig
+            -- Re-validation au point d'usage (auto-correction avant tout autre
+            -- traitement) puis logging du profil de vitesse effectif.
+            local routeConfig = validateRouteSpeedProfile(selectedRouteConfig)
+            logSpeedProfile(routeConfig, routeName)
             -- Both runs use the existing route-mode system.
             -- Run 2 keeps the imported TAS as its base frame timeline, then
             -- applies the selected route profile just like Run 1.
@@ -7290,11 +7836,18 @@ function startPlayback()
             local runStartTime = os.clock()
             local startOffsetT = variantFrames[startFrameIdx].t
             local endT = variantFrames[#variantFrames].t
-            local baselineMultiplier = math.max(0.01, routeConfig.speed_mult)
-            -- The profile is integrated below, rather than recalculated from
-            -- elapsed wall time.  Keep a conservative guard for a very slow
-            -- approach window immediately before a jump.
-            local totalDuration = math.max(0.25, (endT - startOffsetT) / 0.75 + 1.5)
+            -- Gouvernail de vitesse : le multiplicateur de base est clampé une
+            -- dernière fois dans l'enveloppe dérivée de SAFE_SPEED_LIMIT.
+            local baselineMultiplier = math.max(0.01, clampSpeedMult(routeConfig.speed_mult))
+            -- Timing cohérent avec la vitesse sélectionnée : la durée réelle
+            -- maximale du lap est calculée depuis le PLANCHER GARANTI du profil
+            -- (plus un profil est lent, plus il reçoit de temps réel). Aucun
+            -- avortement prématuré, aucun rattrapage accéléré de frames.
+            local profileFloorScale = math.max(
+                MIN_TIMELINE_SCALE,
+                tonumber(routeConfig.min_scale) or baselineMultiplier
+            )
+            local totalDuration = math.max(0.25, (endT - startOffsetT) / profileFloorScale + 1.5)
             local virtualTimelineT = startOffsetT
 
             local currentFramePointer = startFrameIdx
@@ -7310,6 +7863,14 @@ function startPlayback()
             local HANDOFF_BLEND_TIME = 0.35
             activeMotionController = activeMotionController or MotionController.new()
             activeMotionController:reset(hrp)
+            PlaybackTelemetryHandle.controller = activeMotionController
+            pcall(function()
+                activeMotionController:noteEvent("handoff_blend_start", {
+                    frame = startFrameIdx,
+                    t = variantFrames[startFrameIdx] and variantFrames[startFrameIdx].t or 0,
+                    detail = string.format("pathfinder->playback gap=%.2f", (variantFrames[startFrameIdx].c.Position - handoffStartPos).Magnitude),
+                })
+            end)
 
             -- Le facteur caméra est tiré une seule fois pour chaque saut, pas chaque frame.
             -- Fixed left-turn offsets for the first 3 jumps so the camera
@@ -7361,6 +7922,12 @@ function startPlayback()
             local mistakePeakTarget = nil
 
             local captchaPauseStarted = nil
+            -- Telemetrie de phases : apex suivi en vol, journalise a l'atterrissage.
+            local airbornePrev = false
+            local jumpApexY = -math.huge
+            local jumpApexFrame = 0
+            local jumpApexT = 0
+            local handoffBlendDone = false
 
             while isPlaying and isRunningScript do
                 local captchaActive = antiCaptchaEnabled and CaptchaManager and CaptchaManager.IsActive and CaptchaManager.IsActive()
@@ -7416,11 +7983,20 @@ function startPlayback()
                 local timingScale = baselineMultiplier
                 if timingProfile and #timingProfile > 0 then
                     local frameIdxForTiming = math.max(1, math.min(math.floor(currentFramePointer), #timingProfile))
-                    timingScale = tonumber(timingProfile[frameIdxForTiming]) or baselineMultiplier
+                    local profileScale = tonumber(timingProfile[frameIdxForTiming])
+                    if profileScale and profileScale > 0 then
+                        timingScale = profileScale
+                    end
                 end
-                -- Defensive fallback: never allow a non-positive/invalid time scale.
-                if timingScale <= 0 then
-                    timingScale = baselineMultiplier > 0 and baselineMultiplier or 1.0
+                -- HARD SPEED GOVERNOR — clamp appliqué AU POINT où la vitesse
+                -- finale est effectivement consommée (c'est ici, et seulement
+                -- ici, que la timeline avance). Ancien fallback "1.0" supprimé :
+                -- il pouvait dépasser le plafond. Aucun chemin de code (valeur
+                -- du profil, fallback, timing par frame) ne peut franchir
+                -- l'enveloppe dérivée de SAFE_SPEED_LIMIT.
+                timingScale = math.clamp(timingScale, MIN_TIMELINE_SCALE, MAX_TIMELINE_SCALE)
+                if routeConfig.max_scale then
+                    timingScale = math.clamp(timingScale, MIN_TIMELINE_SCALE, routeConfig.max_scale)
                 end
                 -- Integrating the local rate makes every jump's real-time
                 -- offset depend on this lap's independently generated approach
@@ -7438,6 +8014,13 @@ function startPlayback()
                         if jumpCount == failJumpTarget and not hasFailedThisLoop then
                             mistakePeakTarget = jumpPeakData[jumpCount] and jumpPeakData[jumpCount].peakIdx or nil
                         end
+                        pcall(function()
+                            activeMotionController:noteEvent("jump_flag", {
+                                frame = currentFramePointer,
+                                t = curF.t,
+                                detail = string.format("jumpCount=%d", jumpCount),
+                            })
+                        end)
                     end
                 end
 
@@ -7463,6 +8046,40 @@ function startPlayback()
                 end
 
                 local isAirborne = targetVirtualT >= currentJumpStartTime and targetVirtualT <= currentJumpEndTime
+                -- Telemetrie de phase de saut : front montant = jump_start,
+                -- suivi d'apex en vol, front descendant = apex puis landing.
+                if isAirborne and not airbornePrev then
+                    jumpApexY = hrp.Position.Y
+                    jumpApexFrame = currentFramePointer
+                    jumpApexT = targetVirtualT
+                    pcall(function()
+                        activeMotionController:noteEvent("jump_start", {
+                            frame = currentFramePointer,
+                            t = targetVirtualT,
+                            detail = string.format("jumpCount=%d y=%.2f", jumpCount, hrp.Position.Y),
+                        })
+                    end)
+                elseif isAirborne then
+                    if hrp.Position.Y > jumpApexY then
+                        jumpApexY = hrp.Position.Y
+                        jumpApexFrame = currentFramePointer
+                        jumpApexT = targetVirtualT
+                    end
+                elseif (not isAirborne) and airbornePrev then
+                    pcall(function()
+                        activeMotionController:noteEvent("apex", {
+                            frame = jumpApexFrame,
+                            t = jumpApexT,
+                            detail = string.format("apexY=%.2f", jumpApexY),
+                        })
+                        activeMotionController:noteEvent("landing", {
+                            frame = currentFramePointer,
+                            t = targetVirtualT,
+                            detail = string.format("y=%.2f apexY=%.2f", hrp.Position.Y, jumpApexY),
+                        })
+                    end)
+                end
+                airbornePrev = isAirborne
                 local fA = variantFrames[currentFramePointer]
                 local fB = variantFrames[math.min(#variantFrames, currentFramePointer + 1)]
                 local segDuration = fB.t - fA.t
@@ -7478,6 +8095,15 @@ function startPlayback()
                 )
                 handoffT = handoffT * handoffT * (3 - 2 * handoffT)
                 rawPos = handoffStartPos:Lerp(rawPos, handoffT)
+                if not handoffBlendDone and handoffT >= 1 then
+                    handoffBlendDone = true
+                    pcall(function()
+                        activeMotionController:noteEvent("handoff_blend_end", {
+                            frame = currentFramePointer,
+                            t = targetVirtualT,
+                        })
+                    end)
+                end
 
                 local exactPos = rawPos + getHumanMicroJitter(nowClock, meta.safeFactor)
 
@@ -7523,10 +8149,21 @@ function startPlayback()
                     local trackError = (exactPos - hrp.Position).Magnitude
                     if trackError > 3.0 and targetVirtualT > startOffsetT + 0.25 then
                         preciseReplay = true
+                        -- Forcage documente : avant le governor horizontal, ce snap
+                        -- de rattrapage (3+ studs en 1 frame) etait une source
+                        -- majeure de spikes 36 -> 100+ studs/s.
+                        pcall(function()
+                            activeMotionController:noteEvent("recover_precise", {
+                                frame = currentFramePointer,
+                                t = targetVirtualT,
+                                detail = string.format("trackError=%.2f", trackError),
+                            })
+                        end)
                     end
                 end
 
                 local realVelocity
+                -- frameIndex + timelineT alimentent la telemetrie (max + frames).
                 realVelocity = activeMotionController:apply(
                     hrp,
                     humanoid,
@@ -7534,7 +8171,9 @@ function startPlayback()
                     appliedYaw,
                     dt,
                     isAirborne,
-                    preciseReplay
+                    preciseReplay,
+                    currentFramePointer,
+                    targetVirtualT
                 )
                 lastAppliedPos = hrp.Position
 
@@ -7555,6 +8194,8 @@ function startPlayback()
                 -- This avoids the classic “gliding” look when the character is moved
                 -- by a replay system instead of native Humanoid movement.
                 local WALK_START_SPEED = 1.5
+                -- Reference VISUELLE d'animation (pas le governor physique :
+                -- le plafond moteur est SAFE_HORIZONTAL_SPEED, sur X/Z uniquement).
                 local WALK_REFERENCE_SPEED = 16.0
                 local WALK_MIN_PLAYBACK = 0.65
                 local WALK_MAX_PLAYBACK = 1.65
@@ -7624,6 +8265,13 @@ function startPlayback()
 
             local lapDuration = os.clock() - lapStartTime
             if activeMotionController then
+                pcall(function()
+                    activeMotionController:noteEvent("replay_end", {
+                        frame = currentFramePointer,
+                        t = variantFrames[currentFramePointer] and variantFrames[currentFramePointer].t or 0,
+                        detail = string.format("lap=%.2fs", lapDuration),
+                    })
+                end)
                 warn(activeMotionController:report("[PlaybackTelemetry]"))
             end
             if lapDuration > 5 then
