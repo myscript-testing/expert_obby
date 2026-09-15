@@ -4,6 +4,34 @@
 -- Compatible with: loadstring(source)()
 -- The entire script runs inside one protected local entry function.
 local function __AERO_MAIN()
+    -- ========================================================
+    -- CONSOLE SILENCER (ANTI-FLAG) - ACTIF PAR DEFAUT
+    -- ========================================================
+    -- Les moniteurs anti-triche/admin lisent la console (LogService) et
+    -- classent nos logs ([SpeedProfile], [PlaybackEvent], ...) en [flag]/[ban].
+    -- Tous les print/warn DE CE CHUNK sont donc neutralises par defaut via
+    -- ces shadows locaux. La telemetrie reste accumulee en memoire (events +
+    -- report) et consultable SANS console via GetPlaybackTelemetry().
+    -- Debug manuel uniquement : SetPlaybackConsoleVerbose(true).
+    local VERBOSE_CONSOLE = false
+    local _realPrint, _realWarn = print, warn
+    local print = function(...)
+        if VERBOSE_CONSOLE then
+            _realPrint(...)
+        end
+    end
+    local warn = function(...)
+        if VERBOSE_CONSOLE then
+            _realWarn(...)
+        end
+    end
+
+    -- Bascule runtime (globale, resolue a l'appel) : true = logs console.
+    function SetPlaybackConsoleVerbose(v)
+        VERBOSE_CONSOLE = (v == true)
+        return VERBOSE_CONSOLE
+    end
+
 -- ========================================================
 -- STARTUP DIAGNOSTICS / RUNTIME COMPAT
 -- ========================================================
@@ -2137,6 +2165,19 @@ function noteTeleportTelemetry(phase, where)
         end)
     end
 end
+-- Acces SANS console a la telemetrie (aucun print/warn ici) :
+-- dans l'executeur : local report, events = GetPlaybackTelemetry()
+function GetPlaybackTelemetry()
+    local ctrl = PlaybackTelemetryHandle and PlaybackTelemetryHandle.controller
+    if not ctrl then
+        return "controller=nil", {}
+    end
+    local ok, rep = pcall(function()
+        return ctrl:report("[PlaybackTelemetry]")
+    end)
+    return (ok and type(rep) == "string") and rep or "report-error", (ctrl.events or {})
+end
+
 
 -- ================= [ PRE-GENERATED MULTI-ROUTE SYSTEM ] =================
 -- Toutes les variations de trajectoire sont générées une seule fois par route.
