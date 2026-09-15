@@ -49,6 +49,7 @@ warn("[ExpertObby] V8 chargé")
 -- ================= [ HWID PROTECTION ] =================
 function __verify_hwid()
     local allowed_hwids = {
+        ["48b2f42344b0d8636315bf21e3c58641c25fcc87c77a98ff9379a063a7127d3a"] = true,
         ["293e39b6848f9afe55f53139a3d9d870430e464f49715e2566c5e1636867ac64"] = true,
         ["7b66393562366263622d306139312d313166312d616664342d3830366536663665363936337d"] = true,
     }
